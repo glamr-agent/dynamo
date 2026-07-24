@@ -18,21 +18,16 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
     routing::{any, delete, get, post},
+    serve::Listener,
 };
 use futures::StreamExt;
-use hyper_util::{
-    rt::{TokioExecutor, TokioIo},
-    server::conn::auto::Builder as HyperBuilder,
-    service::TowerToHyperService,
-};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
-use std::future::Future;
 use std::io;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
-use tokio::{net::TcpListener, task::JoinHandle, task::JoinSet};
+use tokio::{net::TcpListener, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 use tower_http::trace::TraceLayer;
 
@@ -152,31 +147,22 @@ pub async fn spawn_system_status_server(
     let initial_bind_address = format!("{}:{}", host, port);
     let (listener, actual_address) = bind_system_status_listener(initial_bind_address).await?;
 
-    // Rebind the concrete socket address that was advertised to callers. This
-    // keeps port 0 test callers from holding a stale random port if the server
-    // has to recover after its first successful bind.
-    let rebind_address = actual_address.to_string();
+    // Hand axum a listener that rebinds `actual_address` for itself. If CRIU
+    // closes the socket during restore, the server recovers in the restored
+    // network namespace on the same address the caller was told about, rather
+    // than retrying a dead file descriptor for the life of the process.
+    let listener =
+        RebindingTcpListener::new(listener, actual_address, SYSTEM_STATUS_REBIND_BACKOFF);
     let observer = cancel_token.child_token();
 
-    // Spawn the server supervisor in the background and return the handle. If
-    // CRIU closes the listener during restore, the accept loop returns while
-    // the runtime is still active; the supervisor rebinds the same address in
-    // the restored network namespace.
+    // Spawn the server in the background and return the handle
     let handle = tokio::spawn(async move {
-        supervise_rebinding_server(
-            rebind_address,
-            Some(listener),
-            observer,
-            SYSTEM_STATUS_REBIND_BACKOFF,
-            bind_system_status_listener,
-            {
-                let app = app;
-                move |listener, shutdown_token| {
-                    serve_system_status_once(listener, app.clone(), shutdown_token)
-                }
-            },
-        )
-        .await;
+        if let Err(e) = axum::serve(listener, app)
+            .with_graceful_shutdown(observer.cancelled_owned())
+            .await
+        {
+            tracing::error!("System status server error: {e}");
+        }
     });
 
     Ok((actual_address, handle))
@@ -271,7 +257,10 @@ fn build_system_status_router(server_state: Arc<SystemStatusState>) -> Router {
             move |path| metadata_file_handler(State(state), path)
         }),
     )
-    .fallback(|| async { (StatusCode::NOT_FOUND, "Route not found").into_response() })
+    .fallback(|| async {
+        tracing::info!("[fallback handler] called");
+        (StatusCode::NOT_FOUND, "Route not found").into_response()
+    })
     .layer(TraceLayer::new_for_http().make_span_with(make_system_request_span))
 }
 
@@ -294,71 +283,86 @@ async fn bind_system_status_listener(
     Ok((listener, actual_address))
 }
 
-async fn serve_system_status_once(
-    listener: TcpListener,
-    app: Router,
-    cancel_token: CancellationToken,
-) -> anyhow::Result<()> {
-    let mut connections = JoinSet::new();
+/// A listener that owns its bind address and re-binds it when the socket
+/// underneath stops accepting connections.
+///
+/// CRIU closes the process's listening sockets when it checkpoints. After
+/// restore the file descriptor is still open but no longer usable, so `accept`
+/// fails with a non-transient error every time it is called and the system
+/// status server goes silent while the rest of the runtime carries on.
+///
+/// `axum::serve` cannot report that on its own. [`Listener::accept`] returns no
+/// `Result`, and axum's own `TcpListener` implementation logs the error, sleeps
+/// for a second and tries the same dead socket again, forever. Recovering
+/// inside the listener is the extension point the trait leaves open: the
+/// documentation for `accept` states that an implementation whose accept call
+/// can fail "must take care of logging and retrying".
+struct RebindingTcpListener {
+    /// The address to re-bind. This is the address the initial bind resolved
+    /// to, not the requested one, so a caller that asked for port 0 keeps the
+    /// concrete port it was told about.
+    address: std::net::SocketAddr,
+    listener: Option<TcpListener>,
+    rebind_backoff: Duration,
+}
 
-    loop {
-        tokio::select! {
-            _ = cancel_token.cancelled() => break,
-            Some(result) = connections.join_next(), if !connections.is_empty() => {
-                record_system_status_connection_result(result);
-            }
-            accepted = listener.accept() => {
-                let (stream, remote_address) = match accepted {
-                    Ok(accepted) => accepted,
-                    Err(error) if is_transient_accept_error(&error) => continue,
+impl RebindingTcpListener {
+    fn new(listener: TcpListener, address: std::net::SocketAddr, rebind_backoff: Duration) -> Self {
+        Self {
+            address,
+            listener: Some(listener),
+            rebind_backoff,
+        }
+    }
+}
+
+impl Listener for RebindingTcpListener {
+    type Io = tokio::net::TcpStream;
+    type Addr = std::net::SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            let Some(listener) = self.listener.as_ref() else {
+                match bind_system_status_listener(self.address.to_string()).await {
+                    Ok((listener, _)) => self.listener = Some(listener),
                     Err(error) => {
-                        return Err(anyhow::anyhow!(
-                            "system status server listener accept failed: {error}"
-                        ));
+                        tracing::error!(
+                            "System status server failed to rebind {}; retrying after {:?}: {error}",
+                            self.address,
+                            self.rebind_backoff
+                        );
+                        tokio::time::sleep(self.rebind_backoff).await;
                     }
-                };
+                }
+                continue;
+            };
 
-                let service = TowerToHyperService::new(app.clone());
-                let connection_cancel_token = cancel_token.clone();
-                connections.spawn(async move {
-                    tracing::trace!("system status connection accepted from {remote_address:?}");
-
-                    let io = TokioIo::new(stream);
-                    let mut builder = HyperBuilder::new(TokioExecutor::new());
-                    builder.http2().enable_connect_protocol();
-                    let mut connection = std::pin::pin!(
-                        builder.serve_connection_with_upgrades(io, service)
+            match listener.accept().await {
+                Ok(accepted) => return accepted,
+                // A connection that died between the SYN and our accept says
+                // nothing about the listener; take the next one immediately.
+                Err(error) if is_transient_accept_error(&error) => {
+                    tracing::trace!("system status connection dropped before accept: {error}");
+                }
+                Err(error) => {
+                    tracing::error!(
+                        "System status listener stopped accepting on {}; rebinding after {:?}: {error}",
+                        self.address,
+                        self.rebind_backoff
                     );
-
-                    tokio::select! {
-                        result = connection.as_mut() => {
-                            if let Err(error) = result {
-                                tracing::trace!("failed to serve system status connection: {error:#}");
-                            }
-                        }
-                        _ = connection_cancel_token.cancelled() => {
-                            tracing::trace!("system status connection received graceful shutdown signal");
-                            connection.as_mut().graceful_shutdown();
-                            if let Err(error) = connection.await {
-                                tracing::trace!("failed to gracefully shut down system status connection: {error:#}");
-                            }
-                        }
-                    }
-                });
+                    // Dropping the old listener closes its file descriptor and
+                    // frees the address. A socket that has stopped accepting is
+                    // still bound, so rebinding before this would fail with
+                    // `EADDRINUSE`.
+                    self.listener = None;
+                    tokio::time::sleep(self.rebind_backoff).await;
+                }
             }
         }
     }
 
-    while let Some(result) = connections.join_next().await {
-        record_system_status_connection_result(result);
-    }
-
-    Ok(())
-}
-
-fn record_system_status_connection_result(result: Result<(), tokio::task::JoinError>) {
-    if let Err(error) = result {
-        tracing::warn!("system status connection task failed: {error}");
+    fn local_addr(&self) -> io::Result<Self::Addr> {
+        Ok(self.address)
     }
 }
 
@@ -369,80 +373,6 @@ fn is_transient_accept_error(error: &io::Error) -> bool {
             | io::ErrorKind::ConnectionAborted
             | io::ErrorKind::ConnectionReset
     )
-}
-
-async fn supervise_rebinding_server<L, Bind, BindFuture, Serve, ServeFuture>(
-    bind_address: String,
-    initial_listener: Option<L>,
-    cancel_token: CancellationToken,
-    rebind_backoff: Duration,
-    mut bind: Bind,
-    mut serve: Serve,
-) where
-    L: Send + 'static,
-    Bind: FnMut(String) -> BindFuture + Send + 'static,
-    BindFuture: Future<Output = anyhow::Result<(L, std::net::SocketAddr)>> + Send,
-    Serve: FnMut(L, CancellationToken) -> ServeFuture + Send + 'static,
-    ServeFuture: Future<Output = anyhow::Result<()>> + Send,
-{
-    let mut listener = initial_listener;
-
-    loop {
-        let current_listener = match listener.take() {
-            Some(listener) => listener,
-            None => match bind(bind_address.clone()).await {
-                Ok((listener, _actual_address)) => listener,
-                Err(error) => {
-                    if cancel_token.is_cancelled() {
-                        break;
-                    }
-
-                    tracing::error!(
-                        "System status server failed to bind {}; retrying after {:?}: {error}",
-                        bind_address,
-                        rebind_backoff
-                    );
-
-                    if wait_for_rebind_or_cancel(&cancel_token, rebind_backoff).await {
-                        break;
-                    }
-                    continue;
-                }
-            },
-        };
-
-        let result = serve(current_listener, cancel_token.clone()).await;
-        if cancel_token.is_cancelled() {
-            break;
-        }
-
-        match result {
-            Ok(()) => tracing::warn!(
-                "System status server exited unexpectedly; rebinding {} after {:?}",
-                bind_address,
-                rebind_backoff
-            ),
-            Err(error) => tracing::error!(
-                "System status server error; rebinding {} after {:?}: {error}",
-                bind_address,
-                rebind_backoff
-            ),
-        }
-
-        if wait_for_rebind_or_cancel(&cancel_token, rebind_backoff).await {
-            break;
-        }
-    }
-}
-
-async fn wait_for_rebind_or_cancel(
-    cancel_token: &CancellationToken,
-    rebind_backoff: Duration,
-) -> bool {
-    tokio::select! {
-        _ = cancel_token.cancelled() => true,
-        _ = tokio::time::sleep(rebind_backoff) => false,
-    }
 }
 
 /// Health handler with optional active health checking
@@ -887,11 +817,6 @@ async fn engine_route_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{
-        Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
-    };
-    use tokio::sync::oneshot;
     use tokio::time::Duration;
 
     #[cfg(unix)]
@@ -927,152 +852,95 @@ mod tests {
         );
     }
 
+    /// A listener that has been shut down keeps failing `accept`, so the only
+    /// way a connection can be served afterwards is if the listener rebound.
+    ///
+    /// `shutdown(2)` on a listening socket is the closest stand-in for what
+    /// CRIU does to it. On platforms where that leaves the socket accepting,
+    /// the original listener answers and the test still passes — it just
+    /// stops proving the recovery path, so it is worth keeping honest by
+    /// checking the returned peer address belongs to our own connection.
     #[cfg(unix)]
     #[tokio::test]
-    async fn test_serve_system_status_once_returns_after_listener_shutdown() {
-        let cancel_token = CancellationToken::new();
-        let app = Router::new().route("/test", get(|| async { (StatusCode::OK, "test") }));
+    async fn test_rebinding_listener_serves_again_after_listener_shutdown() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
         let listener_fd = listener.as_raw_fd();
 
-        let server = tokio::spawn(serve_system_status_once(listener, app, cancel_token));
+        let mut rebinding = RebindingTcpListener::new(listener, address, Duration::from_millis(10));
 
         let shutdown_result = unsafe { libc::shutdown(listener_fd, libc::SHUT_RDWR) };
         assert_eq!(shutdown_result, 0, "listener shutdown should succeed");
 
-        let result = tokio::time::timeout(Duration::from_secs(1), server)
-            .await
-            .expect("listener shutdown should make the serve loop return")
-            .expect("serve task should not panic");
+        let accepted = tokio::spawn(async move { rebinding.accept().await });
 
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("listener accept failed"),
-            "serve loop should surface the listener accept error"
+        // The address is unbound between the old listener being dropped and the
+        // rebind completing, so connecting has to be retried.
+        let client = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(stream) = tokio::net::TcpStream::connect(address).await {
+                    return stream;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("listener should rebind and accept connections again");
+
+        let (_io, peer) = tokio::time::timeout(Duration::from_secs(5), accepted)
+            .await
+            .expect("accept should return once the listener is rebound")
+            .expect("accept task should not panic");
+
+        assert_eq!(
+            peer,
+            client.local_addr().unwrap(),
+            "accepted connection should be the one we opened"
         );
     }
 
     #[tokio::test]
-    async fn test_rebinding_supervisor_rebinds_after_unexpected_serve_exit() {
-        let cancel_token = CancellationToken::new();
-        let bind_attempts = Arc::new(AtomicUsize::new(0));
-        let serve_attempts = Arc::new(AtomicUsize::new(0));
-        let (second_serve_tx, second_serve_rx) = oneshot::channel();
-        let second_serve_tx = Arc::new(Mutex::new(Some(second_serve_tx)));
+    async fn test_rebinding_listener_reports_the_address_it_rebinds() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
 
-        let supervisor = tokio::spawn(supervise_rebinding_server(
-            "127.0.0.1:9090".to_string(),
-            Some(0usize),
-            cancel_token.clone(),
-            Duration::from_millis(1),
-            {
-                let bind_attempts = Arc::clone(&bind_attempts);
-                move |_address| {
-                    let bind_attempts = Arc::clone(&bind_attempts);
-                    async move {
-                        let listener_id = bind_attempts.fetch_add(1, Ordering::SeqCst) + 1;
-                        Ok((listener_id, "127.0.0.1:9090".parse().unwrap()))
-                    }
-                }
-            },
-            {
-                let serve_attempts = Arc::clone(&serve_attempts);
-                let second_serve_tx = Arc::clone(&second_serve_tx);
-                move |_listener, _shutdown_token| {
-                    let serve_attempts = Arc::clone(&serve_attempts);
-                    let second_serve_tx = Arc::clone(&second_serve_tx);
-                    async move {
-                        let attempt = serve_attempts.fetch_add(1, Ordering::SeqCst) + 1;
-                        if attempt == 2 {
-                            if let Some(sender) = second_serve_tx.lock().unwrap().take() {
-                                let _ = sender.send(());
-                            }
-                        }
-                        Ok(())
-                    }
-                }
-            },
-        ));
+        let rebinding = RebindingTcpListener::new(listener, address, Duration::from_millis(10));
 
-        tokio::time::timeout(Duration::from_secs(1), second_serve_rx)
-            .await
-            .expect("supervisor should rebind and serve again after the first serve exits")
-            .expect("second serve notification should be sent");
-        cancel_token.cancel();
-
-        tokio::time::timeout(Duration::from_secs(1), supervisor)
-            .await
-            .expect("supervisor should stop after cancellation")
-            .expect("supervisor task should not panic");
-
+        assert_ne!(address.port(), 0, "bind should resolve the ephemeral port");
         assert_eq!(
-            bind_attempts.load(Ordering::SeqCst),
-            1,
-            "initial listener should be reused once, then rebound once"
+            rebinding.local_addr().unwrap(),
+            address,
+            "the resolved address is what gets rebound and advertised"
         );
-        assert_eq!(serve_attempts.load(Ordering::SeqCst), 2);
     }
 
+    /// Recovery must not cost graceful shutdown: axum selects the shutdown
+    /// signal against `accept`, so a listener stuck in a rebind loop still
+    /// stops when the token is cancelled.
     #[tokio::test]
-    async fn test_rebinding_supervisor_stops_without_rebind_after_cancellation() {
+    async fn test_rebinding_listener_still_shuts_down_gracefully() {
         let cancel_token = CancellationToken::new();
-        let bind_attempts = Arc::new(AtomicUsize::new(0));
-        let serve_attempts = Arc::new(AtomicUsize::new(0));
-        let (serve_started_tx, serve_started_rx) = oneshot::channel();
-        let serve_started_tx = Arc::new(Mutex::new(Some(serve_started_tx)));
+        let app = Router::new().route("/test", get(|| async { (StatusCode::OK, "test") }));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let listener = RebindingTcpListener::new(listener, address, Duration::from_millis(10));
 
-        let supervisor = tokio::spawn(supervise_rebinding_server(
-            "127.0.0.1:9090".to_string(),
-            Some(0usize),
-            cancel_token.clone(),
-            Duration::from_millis(1),
-            {
-                let bind_attempts = Arc::clone(&bind_attempts);
-                move |_address| {
-                    let bind_attempts = Arc::clone(&bind_attempts);
-                    async move {
-                        bind_attempts.fetch_add(1, Ordering::SeqCst);
-                        Ok((1usize, "127.0.0.1:9090".parse().unwrap()))
-                    }
-                }
-            },
-            {
-                let serve_attempts = Arc::clone(&serve_attempts);
-                let serve_started_tx = Arc::clone(&serve_started_tx);
-                move |_listener, shutdown_token| {
-                    let serve_attempts = Arc::clone(&serve_attempts);
-                    let serve_started_tx = Arc::clone(&serve_started_tx);
-                    async move {
-                        serve_attempts.fetch_add(1, Ordering::SeqCst);
-                        if let Some(sender) = serve_started_tx.lock().unwrap().take() {
-                            let _ = sender.send(());
-                        }
-                        shutdown_token.cancelled().await;
-                        Ok(())
-                    }
-                }
-            },
-        ));
+        let server = tokio::spawn({
+            let cancel_token = cancel_token.clone();
+            async move {
+                axum::serve(listener, app)
+                    .with_graceful_shutdown(cancel_token.cancelled_owned())
+                    .await
+            }
+        });
 
-        tokio::time::timeout(Duration::from_secs(1), serve_started_rx)
-            .await
-            .expect("initial serve should start")
-            .expect("serve start notification should be sent");
         cancel_token.cancel();
 
-        tokio::time::timeout(Duration::from_secs(1), supervisor)
+        tokio::time::timeout(Duration::from_secs(5), server)
             .await
-            .expect("supervisor should stop after cancellation")
-            .expect("supervisor task should not panic");
-
-        assert_eq!(
-            bind_attempts.load(Ordering::SeqCst),
-            0,
-            "cancellation should not trigger a rebind"
-        );
-        assert_eq!(serve_attempts.load(Ordering::SeqCst), 1);
+            .expect("server should shut down when the cancel token is cancelled")
+            .expect("server task should not panic")
+            .expect("graceful shutdown should not error");
     }
 }
 
