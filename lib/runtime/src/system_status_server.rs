@@ -20,13 +20,19 @@ use axum::{
     routing::{any, delete, get, post},
 };
 use futures::StreamExt;
+use hyper_util::{
+    rt::{TokioExecutor, TokioIo},
+    server::conn::auto::Builder as HyperBuilder,
+    service::TowerToHyperService,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
 use std::future::Future;
+use std::io;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
-use tokio::{net::TcpListener, task::JoinHandle};
+use tokio::{net::TcpListener, task::JoinHandle, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 use tower_http::trace::TraceLayer;
 
@@ -153,7 +159,7 @@ pub async fn spawn_system_status_server(
     let observer = cancel_token.child_token();
 
     // Spawn the server supervisor in the background and return the handle. If
-    // CRIU closes the listener during restore, axum returns from serve while
+    // CRIU closes the listener during restore, the accept loop returns while
     // the runtime is still active; the supervisor rebinds the same address in
     // the restored network namespace.
     let handle = tokio::spawn(async move {
@@ -265,10 +271,7 @@ fn build_system_status_router(server_state: Arc<SystemStatusState>) -> Router {
             move |path| metadata_file_handler(State(state), path)
         }),
     )
-    .fallback(|| async {
-        tracing::info!("[fallback handler] called");
-        (StatusCode::NOT_FOUND, "Route not found").into_response()
-    })
+    .fallback(|| async { (StatusCode::NOT_FOUND, "Route not found").into_response() })
     .layer(TraceLayer::new_for_http().make_span_with(make_system_request_span))
 }
 
@@ -296,10 +299,76 @@ async fn serve_system_status_once(
     app: Router,
     cancel_token: CancellationToken,
 ) -> anyhow::Result<()> {
-    axum::serve(listener, app)
-        .with_graceful_shutdown(cancel_token.cancelled_owned())
-        .await
-        .map_err(Into::into)
+    let mut connections = JoinSet::new();
+
+    loop {
+        tokio::select! {
+            _ = cancel_token.cancelled() => break,
+            Some(result) = connections.join_next(), if !connections.is_empty() => {
+                record_system_status_connection_result(result);
+            }
+            accepted = listener.accept() => {
+                let (stream, remote_address) = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(error) if is_transient_accept_error(&error) => continue,
+                    Err(error) => {
+                        return Err(anyhow::anyhow!(
+                            "system status server listener accept failed: {error}"
+                        ));
+                    }
+                };
+
+                let service = TowerToHyperService::new(app.clone());
+                let connection_cancel_token = cancel_token.clone();
+                connections.spawn(async move {
+                    tracing::trace!("system status connection accepted from {remote_address:?}");
+
+                    let io = TokioIo::new(stream);
+                    let mut builder = HyperBuilder::new(TokioExecutor::new());
+                    builder.http2().enable_connect_protocol();
+                    let mut connection = std::pin::pin!(
+                        builder.serve_connection_with_upgrades(io, service)
+                    );
+
+                    tokio::select! {
+                        result = connection.as_mut() => {
+                            if let Err(error) = result {
+                                tracing::trace!("failed to serve system status connection: {error:#}");
+                            }
+                        }
+                        _ = connection_cancel_token.cancelled() => {
+                            tracing::trace!("system status connection received graceful shutdown signal");
+                            connection.as_mut().graceful_shutdown();
+                            if let Err(error) = connection.await {
+                                tracing::trace!("failed to gracefully shut down system status connection: {error:#}");
+                            }
+                        }
+                    }
+                });
+            }
+        }
+    }
+
+    while let Some(result) = connections.join_next().await {
+        record_system_status_connection_result(result);
+    }
+
+    Ok(())
+}
+
+fn record_system_status_connection_result(result: Result<(), tokio::task::JoinError>) {
+    if let Err(error) = result {
+        tracing::warn!("system status connection task failed: {error}");
+    }
+}
+
+fn is_transient_accept_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+    )
 }
 
 async fn supervise_rebinding_server<L, Bind, BindFuture, Serve, ServeFuture>(
@@ -825,6 +894,9 @@ mod tests {
     use tokio::sync::oneshot;
     use tokio::time::Duration;
 
+    #[cfg(unix)]
+    use std::os::fd::AsRawFd;
+
     // This is a basic test to verify the HTTP server is working before testing other more complicated tests
     #[tokio::test]
     async fn test_http_server_lifecycle() {
@@ -852,6 +924,33 @@ mod tests {
         assert!(
             result.is_ok(),
             "HTTP server should shut down when cancel token is cancelled"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_serve_system_status_once_returns_after_listener_shutdown() {
+        let cancel_token = CancellationToken::new();
+        let app = Router::new().route("/test", get(|| async { (StatusCode::OK, "test") }));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener_fd = listener.as_raw_fd();
+
+        let server = tokio::spawn(serve_system_status_once(listener, app, cancel_token));
+
+        let shutdown_result = unsafe { libc::shutdown(listener_fd, libc::SHUT_RDWR) };
+        assert_eq!(shutdown_result, 0, "listener shutdown should succeed");
+
+        let result = tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("listener shutdown should make the serve loop return")
+            .expect("serve task should not panic");
+
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("listener accept failed"),
+            "serve loop should surface the listener accept error"
         );
     }
 

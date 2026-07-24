@@ -57,6 +57,7 @@ serde_json = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tokio-util = { workspace = true }
+hyper-util = { workspace = true, features = ["server", "server-auto", "service", "tokio", "http1", "http2"] }
 tower-http = { workspace = true }
 tracing = { workspace = true }
 mio = { workspace = true }
