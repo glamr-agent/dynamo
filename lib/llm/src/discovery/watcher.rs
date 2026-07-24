@@ -1436,6 +1436,7 @@ impl ModelWatcher {
         let mut worker_set = WorkerSet::new(namespace.clone(), checksum.to_string(), card.clone());
         worker_set.set_endpoint_id(endpoint.id());
         worker_set.set_instance_watcher(instance_watcher);
+        let non_cpu_to_cpu_ratio = router_config.resolved_non_cpu_to_cpu_ratio();
 
         // A surface-less Encode worker is reached only through EncoderRouter.
         // Register it for serving readiness, publish its endpoint to any
@@ -1713,6 +1714,7 @@ impl ModelWatcher {
                         encoder_chooser.clone(),
                         uses_multimodal_cache_routing(card),
                         router_config.session_affinity_ttl_secs,
+                        non_cpu_to_cpu_ratio,
                     )
                     .await
                     .context("build_preprocessed_routing")?,
@@ -1844,8 +1846,11 @@ impl ModelWatcher {
             let push_router = PushRouter::<
                 NvCreateEmbeddingRequest,
                 Annotated<NvCreateEmbeddingResponse>,
-            >::from_client_with_monitor(
-                client, router_config.router_mode, None
+            >::from_client_with_monitor_and_ratio(
+                client,
+                router_config.router_mode,
+                None,
+                non_cpu_to_cpu_ratio,
             )
             .await?;
             worker_set.embeddings_engine = Some(Arc::new(push_router));
@@ -1864,8 +1869,11 @@ impl ModelWatcher {
                 let chat_router = PushRouter::<
                     NvCreateChatCompletionRequest,
                     Annotated<NvCreateChatCompletionStreamResponse>,
-                >::from_client_with_monitor(
-                    client.clone(), router_config.router_mode, None
+                >::from_client_with_monitor_and_ratio(
+                    client.clone(),
+                    router_config.router_mode,
+                    None,
+                    non_cpu_to_cpu_ratio,
                 )
                 .await?;
                 worker_set.chat_engine = Some(Arc::new(chat_router));
@@ -1875,7 +1883,12 @@ impl ModelWatcher {
                 let images_router = PushRouter::<
                     NvCreateImageRequest,
                     Annotated<NvImagesResponse>,
-                >::from_client_with_monitor(client.clone(), router_config.router_mode, None)
+                >::from_client_with_monitor_and_ratio(
+                    client.clone(),
+                    router_config.router_mode,
+                    None,
+                    non_cpu_to_cpu_ratio,
+                )
                 .await?;
                 worker_set.images_engine = Some(Arc::new(images_router));
             }
@@ -1884,7 +1897,12 @@ impl ModelWatcher {
                 let videos_router = PushRouter::<
                     NvCreateVideoRequest,
                     Annotated<NvVideosResponse>,
-                >::from_client_with_monitor(client.clone(), router_config.router_mode, None)
+                >::from_client_with_monitor_and_ratio(
+                    client.clone(),
+                    router_config.router_mode,
+                    None,
+                    non_cpu_to_cpu_ratio,
+                )
                 .await?;
                 worker_set.videos_engine = Some(Arc::new(videos_router));
             }
@@ -1893,28 +1911,38 @@ impl ModelWatcher {
                 let audios_router = PushRouter::<
                     NvCreateAudioSpeechRequest,
                     Annotated<NvAudioSpeechResponse>,
-                >::from_client_with_monitor(
-                    client.clone(), router_config.router_mode, None
+                >::from_client_with_monitor_and_ratio(
+                    client.clone(),
+                    router_config.router_mode,
+                    None,
+                    non_cpu_to_cpu_ratio,
                 )
                 .await?;
                 worker_set.audios_engine = Some(Arc::new(audios_router));
             }
         } else if card.model_input == ModelInput::Text && card.model_type.supports_chat() {
             // Case: Text + Chat (pure text-to-text, no diffusion)
-            let push_router =
-                PushRouter::<
-                    NvCreateChatCompletionRequest,
-                    Annotated<NvCreateChatCompletionStreamResponse>,
-                >::from_client_with_monitor(client, router_config.router_mode, None)
-                .await?;
+            let push_router = PushRouter::<
+                NvCreateChatCompletionRequest,
+                Annotated<NvCreateChatCompletionStreamResponse>,
+            >::from_client_with_monitor_and_ratio(
+                client,
+                router_config.router_mode,
+                None,
+                non_cpu_to_cpu_ratio,
+            )
+            .await?;
             worker_set.chat_engine = Some(Arc::new(push_router));
         } else if card.model_input == ModelInput::Text && card.model_type.supports_completions() {
             // Case: Text + Completions
             let push_router = PushRouter::<
                 NvCreateCompletionRequest,
                 Annotated<NvCreateCompletionResponse>,
-            >::from_client_with_monitor(
-                client, router_config.router_mode, None
+            >::from_client_with_monitor_and_ratio(
+                client,
+                router_config.router_mode,
+                None,
+                non_cpu_to_cpu_ratio,
             )
             .await?;
             worker_set.completions_engine = Some(Arc::new(push_router));
@@ -1932,8 +1960,11 @@ impl ModelWatcher {
             let router = PushRouter::<
                 PreprocessedEmbeddingRequest,
                 Annotated<EmbeddingsEngineOutput>,
-            >::from_client_with_monitor(
-                client, router_config.router_mode, None
+            >::from_client_with_monitor_and_ratio(
+                client,
+                router_config.router_mode,
+                None,
+                non_cpu_to_cpu_ratio,
             )
             .await?;
 
@@ -1956,8 +1987,11 @@ impl ModelWatcher {
             let push_router = PushRouter::<
                 NvCreateTensorRequest,
                 Annotated<NvCreateTensorResponse>,
-            >::from_client_with_monitor(
-                client, router_config.router_mode, None
+            >::from_client_with_monitor_and_ratio(
+                client,
+                router_config.router_mode,
+                None,
+                non_cpu_to_cpu_ratio,
             )
             .await?;
             worker_set.tensor_engine = Some(Arc::new(push_router));
@@ -1967,8 +2001,11 @@ impl ModelWatcher {
             let realtime_router = PushRouter::<
                 RealtimeClientEvent,
                 Annotated<RealtimeServerEvent>,
-            >::from_client_with_monitor(
-                client, router_config.router_mode, None
+            >::from_client_with_monitor_and_ratio(
+                client,
+                router_config.router_mode,
+                None,
+                non_cpu_to_cpu_ratio,
             )
             .await?;
             worker_set.realtime_engine = Some(Arc::new(realtime_router));

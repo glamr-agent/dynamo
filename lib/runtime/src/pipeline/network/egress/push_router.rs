@@ -61,6 +61,31 @@ fn response_inactivity_timeout() -> Option<std::time::Duration> {
         .map(std::time::Duration::from_secs)
 }
 
+pub const DEFAULT_NON_CPU_TO_CPU_RATIO: usize = 8;
+
+/// Resolve the non-CPU-to-CPU capacity ratio for device-aware weighted routing.
+///
+/// Explicit configuration takes precedence over the legacy environment variable.
+/// Invalid, missing, or sub-1 values fall back to the existing effective default.
+pub fn resolve_non_cpu_to_cpu_ratio(configured: Option<usize>, env_value: Option<&str>) -> usize {
+    configured
+        .filter(|value| *value >= 1)
+        .or_else(|| {
+            env_value
+                .and_then(|value| value.parse::<usize>().ok())
+                .filter(|value| *value >= 1)
+        })
+        .unwrap_or(DEFAULT_NON_CPU_TO_CPU_RATIO)
+}
+
+fn non_cpu_to_cpu_ratio_from_env() -> usize {
+    use crate::config::environment_names::router::DYN_ENCODER_CUDA_TO_CPU_RATIO;
+    resolve_non_cpu_to_cpu_ratio(
+        None,
+        std::env::var(DYN_ENCODER_CUDA_TO_CPU_RATIO).ok().as_deref(),
+    )
+}
+
 /// RAII handle for one in-flight unit of work charged against
 /// [`RoutingOccupancyState`]. The counter is incremented at construction; the
 /// matching decrement is emitted on drop (or by [`Self::into_tracked_stream`]).
@@ -165,6 +190,9 @@ where
 
     /// Shared request occupancy state for tracked routing modes.
     occupancy_state: Option<Arc<RoutingOccupancyState>>,
+
+    /// Resolved non-CPU-to-CPU capacity ratio for device-aware weighted routing.
+    non_cpu_to_cpu_ratio: usize,
 
     /// Optional cache index for direct multimodal embedding cache lookups.
     /// Currently consumed by `RouterMode::DeviceAwareWeighted`.
@@ -545,38 +573,29 @@ where
         client: Client,
         router_mode: RouterMode,
     ) -> anyhow::Result<Self> {
-        let addressed = addressed_router(&client.endpoint).await?;
-
-        let occupancy_state = if matches!(
-            router_mode,
-            RouterMode::PowerOfTwoChoices
-                | RouterMode::LeastLoaded
-                | RouterMode::DeviceAwareWeighted
-        ) {
-            Some(get_or_create_routing_occupancy_state(&client.endpoint).await)
-        } else {
-            None
-        };
-
-        // Cancel orphaned pending response streams when workers die.
-        spawn_instance_removal_watcher(
-            client.endpoint.clone(),
-            addressed.clone(),
-            client.endpoint.drt().primary_token(),
-        );
-
-        Ok(PushRouter {
+        Self::from_client_no_fault_detection_with_ratio(
             client,
-            addressed,
             router_mode,
-            round_robin_counter: Arc::new(AtomicU64::new(0)),
-            fault_detection_enabled: false,
-            response_timeout: response_inactivity_timeout(),
-            occupancy_state,
-            multimodal_cache_indexer: None,
-            multimodal_cache_key_extractor: None,
-            _phantom: PhantomData,
-        })
+            non_cpu_to_cpu_ratio_from_env(),
+        )
+        .await
+    }
+
+    pub async fn from_client_no_fault_detection_with_ratio(
+        client: Client,
+        router_mode: RouterMode,
+        non_cpu_to_cpu_ratio: usize,
+    ) -> anyhow::Result<Self> {
+        Self::build(
+            client,
+            router_mode,
+            None,
+            None,
+            None,
+            false,
+            non_cpu_to_cpu_ratio,
+        )
+        .await
     }
 
     /// Create a new PushRouter with an optional worker load monitor.
@@ -593,6 +612,23 @@ where
         Self::from_client_with_state(client, router_mode, worker_monitor, None, None).await
     }
 
+    pub async fn from_client_with_monitor_and_ratio(
+        client: Client,
+        router_mode: RouterMode,
+        worker_monitor: Option<Arc<dyn WorkerLoadMonitor>>,
+        non_cpu_to_cpu_ratio: usize,
+    ) -> anyhow::Result<Self> {
+        Self::from_client_with_state_and_ratio(
+            client,
+            router_mode,
+            worker_monitor,
+            None,
+            None,
+            non_cpu_to_cpu_ratio,
+        )
+        .await
+    }
+
     /// Create a new PushRouter with optional load monitoring and multimodal cache indexing.
     pub async fn from_client_with_state(
         client: Client,
@@ -600,6 +636,47 @@ where
         worker_monitor: Option<Arc<dyn WorkerLoadMonitor>>,
         multimodal_cache_indexer: Option<Arc<dyn MultimodalCacheIndex>>,
         multimodal_cache_key_extractor: Option<MultimodalCacheKeyExtractor<T>>,
+    ) -> anyhow::Result<Self> {
+        Self::from_client_with_state_and_ratio(
+            client,
+            router_mode,
+            worker_monitor,
+            multimodal_cache_indexer,
+            multimodal_cache_key_extractor,
+            non_cpu_to_cpu_ratio_from_env(),
+        )
+        .await
+    }
+
+    pub async fn from_client_with_state_and_ratio(
+        client: Client,
+        router_mode: RouterMode,
+        worker_monitor: Option<Arc<dyn WorkerLoadMonitor>>,
+        multimodal_cache_indexer: Option<Arc<dyn MultimodalCacheIndex>>,
+        multimodal_cache_key_extractor: Option<MultimodalCacheKeyExtractor<T>>,
+        non_cpu_to_cpu_ratio: usize,
+    ) -> anyhow::Result<Self> {
+        Self::build(
+            client,
+            router_mode,
+            worker_monitor,
+            multimodal_cache_indexer,
+            multimodal_cache_key_extractor,
+            true,
+            non_cpu_to_cpu_ratio,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn build(
+        client: Client,
+        router_mode: RouterMode,
+        worker_monitor: Option<Arc<dyn WorkerLoadMonitor>>,
+        multimodal_cache_indexer: Option<Arc<dyn MultimodalCacheIndex>>,
+        multimodal_cache_key_extractor: Option<MultimodalCacheKeyExtractor<T>>,
+        fault_detection_enabled: bool,
+        non_cpu_to_cpu_ratio: usize,
     ) -> anyhow::Result<Self> {
         let addressed = addressed_router(&client.endpoint).await?;
 
@@ -640,9 +717,10 @@ where
             addressed,
             router_mode,
             round_robin_counter: Arc::new(AtomicU64::new(0)),
-            fault_detection_enabled: true,
+            fault_detection_enabled,
             response_timeout: response_inactivity_timeout(),
             occupancy_state,
+            non_cpu_to_cpu_ratio: resolve_non_cpu_to_cpu_ratio(Some(non_cpu_to_cpu_ratio), None),
             multimodal_cache_indexer,
             multimodal_cache_key_extractor,
             _phantom: PhantomData,
@@ -1014,12 +1092,6 @@ where
             .iter()
             .map(|instance| (instance.instance_id, instance.device_type.clone()))
             .collect();
-        let cuda_to_cpu_ratio = std::env::var("DYN_ENCODER_CUDA_TO_CPU_RATIO")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .filter(|value| *value >= 1)
-            .unwrap_or(8);
-
         let (request_cache_keys, cache_matched_candidates) =
             if let (Some(indexer), Some(extractor)) = (
                 self.multimodal_cache_indexer.as_ref(),
@@ -1053,7 +1125,12 @@ where
         let candidates = if full_embedding_cache_hit {
             full_cache_candidates
         } else {
-            device_aware_candidate_group(state, instance_ids, &device_type_map, cuda_to_cpu_ratio)
+            device_aware_candidate_group(
+                state,
+                instance_ids,
+                &device_type_map,
+                self.non_cpu_to_cpu_ratio,
+            )
         };
 
         DeviceAwareCandidates {
@@ -1171,16 +1248,11 @@ where
                     .iter()
                     .map(|instance| (instance.instance_id, instance.device_type.clone()))
                     .collect();
-                let cuda_to_cpu_ratio = std::env::var("DYN_ENCODER_CUDA_TO_CPU_RATIO")
-                    .ok()
-                    .and_then(|value| value.parse::<usize>().ok())
-                    .filter(|value| *value >= 1)
-                    .unwrap_or(8);
                 let candidates = device_aware_candidate_group(
                     state,
                     &instance_ids,
                     &device_type_map,
-                    cuda_to_cpu_ratio,
+                    self.non_cpu_to_cpu_ratio,
                 );
                 state.peek_min(&candidates)
             }
@@ -1767,6 +1839,24 @@ mod tests {
         }
 
         fn remove_worker(&self, _worker_id: u64) {}
+    }
+
+    #[test]
+    fn non_cpu_to_cpu_ratio_prefers_valid_explicit_config() {
+        assert_eq!(resolve_non_cpu_to_cpu_ratio(Some(3), Some("7")), 3);
+    }
+
+    #[test]
+    fn non_cpu_to_cpu_ratio_uses_valid_env_when_config_is_unset() {
+        assert_eq!(resolve_non_cpu_to_cpu_ratio(None, Some("7")), 7);
+    }
+
+    #[test]
+    fn non_cpu_to_cpu_ratio_falls_back_to_default_for_invalid_values() {
+        assert_eq!(resolve_non_cpu_to_cpu_ratio(Some(0), Some("7")), 7);
+        assert_eq!(resolve_non_cpu_to_cpu_ratio(Some(0), Some("0")), 8);
+        assert_eq!(resolve_non_cpu_to_cpu_ratio(None, Some("not-a-number")), 8);
+        assert_eq!(resolve_non_cpu_to_cpu_ratio(None, None), 8);
     }
 
     #[test]
@@ -2410,6 +2500,77 @@ mod tests {
         let selected =
             futures::executor::block_on(state.select_exact_min_and_increment(&candidates)).unwrap();
         assert_eq!(selected, 2);
+    }
+
+    #[test]
+    fn device_aware_group_with_ratio_one_allows_cpu_while_default_ratio_does_not() {
+        let state = RoutingOccupancyState::default();
+        for _ in 0..4 {
+            state.increment(3);
+            state.increment(4);
+        }
+        state.increment(1);
+
+        let instance_ids = vec![1, 2, 3, 4];
+        let device_type_map = HashMap::from([
+            (1, Some(DeviceType::Cpu)),
+            (2, Some(DeviceType::Cpu)),
+            (3, Some(DeviceType::Cuda)),
+            (4, Some(DeviceType::Cuda)),
+        ]);
+
+        assert_eq!(
+            device_aware_candidate_group(
+                &state,
+                &instance_ids,
+                &device_type_map,
+                DEFAULT_NON_CPU_TO_CPU_RATIO,
+            ),
+            vec![3, 4]
+        );
+        assert_eq!(
+            device_aware_candidate_group(&state, &instance_ids, &device_type_map, 1),
+            vec![1, 2]
+        );
+    }
+
+    #[tokio::test]
+    async fn device_aware_constructor_stores_resolved_ratio() {
+        let rt = Runtime::from_current().unwrap();
+        let drt = DistributedRuntime::new(rt.clone(), DistributedConfig::process_local())
+            .await
+            .unwrap();
+        let endpoint = drt
+            .namespace("test_device_aware_ratio_constructor".to_string())
+            .unwrap()
+            .component("test_component".to_string())
+            .unwrap()
+            .endpoint("test_endpoint".to_string());
+
+        let explicit_router = PushRouter::<u64, TestResponse>::from_client_with_monitor_and_ratio(
+            endpoint.client().await.unwrap(),
+            RouterMode::DeviceAwareWeighted,
+            None,
+            3,
+        )
+        .await
+        .unwrap();
+        assert_eq!(explicit_router.non_cpu_to_cpu_ratio, 3);
+
+        let floored_router = PushRouter::<u64, TestResponse>::from_client_with_monitor_and_ratio(
+            endpoint.client().await.unwrap(),
+            RouterMode::DeviceAwareWeighted,
+            None,
+            0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            floored_router.non_cpu_to_cpu_ratio,
+            DEFAULT_NON_CPU_TO_CPU_RATIO
+        );
+
+        rt.shutdown();
     }
 
     #[tokio::test]
