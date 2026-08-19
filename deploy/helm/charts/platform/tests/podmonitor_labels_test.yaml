@@ -1,0 +1,65 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+suite: PodMonitor labels
+templates:
+  - charts/dynamo-operator/templates/prometheus.yaml
+tests:
+  - it: adds configured labels to every generated PodMonitor
+    set:
+      dynamo-operator.dynamo.metrics.podMonitors.enabled: true
+      dynamo-operator.dynamo.metrics.podMonitors.labels.release: kube-prometheus-stack
+    asserts:
+      - hasDocuments:
+          count: 4
+      - equal:
+          path: metadata.labels.release
+          value: kube-prometheus-stack
+        documentSelector:
+          path: metadata.name
+          value: dynamo-frontend
+      - equal:
+          path: metadata.labels.release
+          value: kube-prometheus-stack
+        documentSelector:
+          path: metadata.name
+          value: dynamo-worker
+      - equal:
+          path: metadata.labels.release
+          value: kube-prometheus-stack
+        documentSelector:
+          path: metadata.name
+          value: dynamo-planner
+      - equal:
+          path: metadata.labels.release
+          value: kube-prometheus-stack
+        documentSelector:
+          path: metadata.name
+          value: dynamo-router
+
+  - it: keeps generated PodMonitor metadata unlabeled by default
+    set:
+      dynamo-operator.dynamo.metrics.podMonitors.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 4
+      - notExists:
+          path: metadata.labels
+        documentSelector:
+          path: metadata.name
+          value: dynamo-frontend
+      - notExists:
+          path: metadata.labels
+        documentSelector:
+          path: metadata.name
+          value: dynamo-worker
+      - notExists:
+          path: metadata.labels
+        documentSelector:
+          path: metadata.name
+          value: dynamo-planner
+      - notExists:
+          path: metadata.labels
+        documentSelector:
+          path: metadata.name
+          value: dynamo-router
