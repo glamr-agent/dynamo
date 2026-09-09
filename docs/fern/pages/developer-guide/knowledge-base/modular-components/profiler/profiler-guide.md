@@ -687,6 +687,14 @@ utilities used by the sidecar script: `grep`, `awk`, `tr`, `sed`, `date`, `cat`,
 (`env`, `envFrom`, `volumeMounts`, `securityContext`, `command`/`args`) are ignored so
 controller-owned mounts such as `profiling-output` at `/data` stay intact.
 
+The sidecar checks for `kubectl` before it starts polling. An image without it exits
+immediately with an `ERROR:` line naming the missing binary, which drives the
+`DynamoGraphDeploymentRequest` to `Failed` with that reason in its conditions instead of
+leaving it in `Profiling`. The sidecar also gives up if `kubectl` is present but every
+call keeps failing for five minutes — a revoked ServiceAccount RBAC binding or an
+unreachable API server — while still tolerating brief transient failures. Read either
+diagnostic with `kubectl describe dgdr <name> -n $NAMESPACE`.
+
 **ConfigMaps:**
 - `dgdr-output-<name>`: Generated DGD configuration
 - `planner-profile-data-XXXX`: Profiling data for Planner and mocker consumers (JSON), with a generated suffix. Only created for thorough sweeping when profile data is needed.
