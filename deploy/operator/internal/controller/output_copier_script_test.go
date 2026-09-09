@@ -30,24 +30,18 @@ import (
 	"time"
 )
 
-// These tests render the production sidecarScriptTemplate through renderSidecarScript
-// and actually execute the result, because the defect they guard is a runtime
-// behavior: the script used to loop forever when kubectl was unusable. Asserting on
-// the text of the constant would pass with the fix reverted and prove nothing.
-//
-// None of these tests may call t.Parallel: the rendered script writes to the fixed
-// paths /tmp/progress.yaml and /tmp/cm.yaml, which are container-local in production
-// but shared on a test host.
+// These tests execute the rendered production script: the defect they guard is a
+// runtime hang, which an assertion on the constant's text would not catch.
 
-// posixUtilitiesUsedByScript lists the external binaries the rendered script invokes,
-// excluding kubectl. Each test builds a PATH containing exactly these, which is what
-// lets a test decide whether kubectl is present.
+// No test here may call t.Parallel. The rendered script writes to the fixed paths
+// /tmp/progress.yaml and /tmp/cm.yaml, which are shared on a test host.
+
+// posixUtilitiesUsedByScript lists the binaries the rendered script invokes, excluding
+// kubectl. Each test builds a PATH of exactly these, so it controls whether kubectl resolves.
 var posixUtilitiesUsedByScript = []string{"date", "grep", "awk", "sed", "tr", "cat", "sleep"}
 
 // pipefailShell resolves a shell that accepts "set -o pipefail", which the rendered
-// script requires on its second line. The production sidecar image satisfies this
-// (bitnami/kubectl's /bin/sh is bash, and BusyBox ash supports the option), but a
-// Debian-family test host points /bin/sh at dash, which rejects it.
+// script requires. A Debian-family host points /bin/sh at dash, which rejects it.
 func pipefailShell(t *testing.T) string {
 	t.Helper()
 
@@ -66,9 +60,8 @@ func pipefailShell(t *testing.T) string {
 	return ""
 }
 
-// isolatedPATHDir builds a directory of symlinks to the POSIX utilities the script
-// uses and returns it. A test sets PATH to this directory alone, so the only way
-// kubectl can be resolved is if the test puts a shim in it.
+// isolatedPATHDir returns a directory of symlinks to the utilities the script uses.
+// A test sets PATH to it alone, so kubectl resolves only if the test adds a shim.
 func isolatedPATHDir(t *testing.T) string {
 	t.Helper()
 
@@ -86,10 +79,8 @@ func isolatedPATHDir(t *testing.T) string {
 	return dir
 }
 
-// writeKubectlShim installs a fake kubectl in pathDir that appends its own argv to
-// logFile and then exits with exitCode. When exitCode is zero, a "get" invocation
-// answers with a payload containing "terminated", which is what the script's poll
-// loop greps for.
+// writeKubectlShim installs a fake kubectl in pathDir that logs its argv to logFile and
+// exits with exitCode. When exitCode is 0, "get" answers with the "terminated" the loop greps.
 func writeKubectlShim(t *testing.T, pathDir string, logFile string, exitCode int) {
 	t.Helper()
 
@@ -140,10 +131,8 @@ func renderOutputCopierScript(t *testing.T, outputDir string, kubectlFailureDead
 	return script
 }
 
-// runOutputCopierScript executes the rendered script with PATH set to pathDir alone
-// and returns its exit code, combined output, and how long it ran. An exit code of
-// -1 means the script was still running when the bound elapsed, which is the hang
-// this file exists to detect.
+// runOutputCopierScript runs the rendered script with PATH as pathDir alone. Exit code
+// -1 means it was still running at the bound, which is the hang this file detects.
 func runOutputCopierScript(t *testing.T, script string, pathDir string, bound time.Duration) (int, string, time.Duration) {
 	t.Helper()
 
@@ -183,9 +172,8 @@ func runOutputCopierScript(t *testing.T, script string, pathDir string, bound ti
 	return 0, "", elapsed
 }
 
-// TestOutputCopierScriptFailsFastWhenKubectlIsMissing is the regression barrier. With
-// the preflight reverted the script spins on "sleep 10" forever, so this test hits
-// the bound and fails, reproducing the reported hang.
+// TestOutputCopierScriptFailsFastWhenKubectlIsMissing is the regression barrier: with the
+// preflight reverted the script spins on "sleep 10" forever and this test hits its bound.
 func TestOutputCopierScriptFailsFastWhenKubectlIsMissing(t *testing.T) {
 	outputDir := t.TempDir()
 	pathDir := isolatedPATHDir(t)
@@ -243,10 +231,8 @@ func TestOutputCopierScriptCompletesWhenKubectlWorks(t *testing.T) {
 	}
 }
 
-// TestOutputCopierScriptExitsWhenKubectlAlwaysFails covers the case the preflight
-// cannot catch: kubectl is installed but every call fails, as with revoked RBAC or an
-// unreachable API server. The first failure must be tolerated as a transient and the
-// sustained failure must terminate the container.
+// TestOutputCopierScriptExitsWhenKubectlAlwaysFails covers what the preflight cannot:
+// kubectl present but every call failing, as with revoked RBAC or an unreachable API server.
 func TestOutputCopierScriptExitsWhenKubectlAlwaysFails(t *testing.T) {
 	outputDir := t.TempDir()
 	pathDir := isolatedPATHDir(t)

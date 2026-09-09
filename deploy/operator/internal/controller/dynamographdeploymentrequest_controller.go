@@ -86,10 +86,8 @@ const (
 	// Sidecar image
 	SidecarImage = "bitnami/kubectl:latest"
 
-	// How long the output copier tolerates continuously failing kubectl calls before
-	// it gives up and exits non-zero. Long enough to ride out API throttling or a
-	// brief apiserver blip, short enough that a permanently broken sidecar surfaces
-	// as a failed DGDR instead of hanging in Profiling forever.
+	// Long enough to ride out API throttling, short enough that a permanently broken
+	// sidecar fails the DGDR instead of hanging in Profiling forever.
 	outputCopierKubectlFailureDeadlineSeconds = 300
 
 	// Volume names
@@ -158,15 +156,8 @@ const sidecarScriptTemplate = `
 set -e
 set -o pipefail
 
-# Preflight: the sidecar is useless without kubectl. Its only two jobs -- noticing
-# that the profiler container terminated, and writing results back to the output
-# ConfigMap -- both go through the API server. Without kubectl the poll loop below
-# would spin on "sleep 10" forever, the pod would never reach a terminal phase, and
-# the DGDR would stay in Profiling indefinitely. Fail loudly instead: a non-zero exit
-# lets the pod reach a terminal phase, so the Job reports JobFailed and the controller
-# sets DGDRPhaseFailed. These ERROR lines stay in this container's log -- nothing reads
-# them into the DGDR condition, whose message getProfilingJobErrorDetails builds from
-# the profiler container's exit code.
+# Without kubectl the poll loop never sees the profiler terminate, so the pod stays
+# running and the DGDR sits in Profiling forever. Fail fast instead.
 if ! command -v kubectl >/dev/null 2>&1; then
   echo "ERROR: kubectl was not found in the output-copier image." >&2
   echo "ERROR: The output-copier sidecar needs kubectl to detect profiler termination and to write results to ConfigMap {{.ConfigMapName}}." >&2
@@ -180,10 +171,8 @@ START_TIME=$(date +%s)
 LAST_PROGRESS_LOG=$START_TIME
 PROGRESS_INTERVAL=300
 
-# A kubectl that exists but always fails (revoked RBAC, unreachable API server) hangs
-# the loop just as badly as a missing binary. Track how long kubectl has been failing
-# continuously and give up once the window exceeds the deadline. Any success resets
-# the window, so genuine transients stay tolerated.
+# A kubectl that always fails (revoked RBAC, unreachable API server) hangs the loop just
+# as badly as a missing one. Any success resets the window, so transients stay tolerated.
 KUBECTL_FAILURE_DEADLINE={{.KubectlFailureDeadlineSeconds}}
 KUBECTL_FIRST_FAILURE=0
 
@@ -402,9 +391,7 @@ echo "Saved profiling output to ConfigMap {{.ConfigMapName}}"
 `
 
 // renderSidecarScript renders sidecarScriptTemplate with the supplied template data.
-// The result becomes the output copier container's single shell argument. Extracted
-// from the job builder so tests can render and execute the production template rather
-// than a copy of it.
+// The result becomes the output copier container's single shell argument.
 func renderSidecarScript(data map[string]string) (string, error) {
 	tmpl, err := template.New("sidecar").Parse(sidecarScriptTemplate)
 	if err != nil {
