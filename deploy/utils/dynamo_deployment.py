@@ -43,6 +43,15 @@ TERMINAL_POD_WAITING_REASONS: frozenset[str] = frozenset(
     }
 )
 
+# The DynamoGraphDeployment CRD still serves both versions, and they name
+# their components differently: v1alpha1 keys them in a mapping under
+# `spec.services`, v1beta1 lists them as objects under `spec.components`,
+# each carrying its own `name`. This client is handed both shapes — the
+# profiler emits v1beta1 and `main()` below accepts an arbitrary YAML file —
+# so it detects the schema rather than assuming one.
+CRD_VERSION_V1ALPHA1 = "v1alpha1"
+CRD_VERSION_V1BETA1 = "v1beta1"
+
 
 class DeploymentFailedError(RuntimeError):
     """Raised when a DynamoGraphDeployment's pods enter a terminal failure
@@ -52,6 +61,52 @@ class DeploymentFailedError(RuntimeError):
     profiler) can skip a candidate immediately rather than waiting out
     the full deployment timeout.
     """
+
+
+def detect_dgd_crd_version(deployment_spec: Dict[str, Any]) -> str:
+    """Return the CRD version a DynamoGraphDeployment manifest belongs to.
+
+    `apiVersion` is authoritative when present; otherwise the spec shape
+    decides, so a manifest written without an explicit `apiVersion` still
+    resolves. Follows the same convention as `_detect_schema` in
+    `tests/deploy/dgd_utils.py`.
+    """
+    api_version = deployment_spec.get("apiVersion") or ""
+    if api_version.endswith(f"/{CRD_VERSION_V1BETA1}"):
+        return CRD_VERSION_V1BETA1
+    if api_version.endswith(f"/{CRD_VERSION_V1ALPHA1}"):
+        return CRD_VERSION_V1ALPHA1
+    spec = deployment_spec.get("spec") or {}
+    if isinstance(spec.get("components"), list):
+        return CRD_VERSION_V1BETA1
+    return CRD_VERSION_V1ALPHA1
+
+
+def extract_component_names(
+    deployment_spec: Dict[str, Any], deployment_name: str
+) -> List[str]:
+    """Return the component names of a DynamoGraphDeployment, in manifest order.
+
+    The names are returned with their original casing because the operator
+    stamps them verbatim onto the `nvidia.com/dynamo-component` pod label,
+    which is what the log fetch and the terminal-failure check select on.
+    """
+    spec = deployment_spec.get("spec") or {}
+    components = spec.get("components")
+    if isinstance(components, list):
+        return [
+            component["name"]
+            for component in components
+            if isinstance(component, dict) and component.get("name")
+        ]
+    services = spec.get("services")
+    if isinstance(services, dict):
+        return list(services.keys())
+    raise ValueError(
+        f"DynamoGraphDeployment '{deployment_name}' declares no components: "
+        "expected a list under 'spec.components' (v1beta1) or a mapping under "
+        "'spec.services' (v1alpha1)"
+    )
 
 
 def find_available_port(start_port: int = 8000) -> int:
@@ -141,6 +196,11 @@ class DynamoDeploymentClient:
         self.model_name = model_name
         self.service_name = service_name or f"{self.deployment_name}-frontend"
         self.components: List[str] = []  # Will store component names from CR
+        self._original_components: List[str] = []
+        # Replaced with the version detected from the manifest in
+        # create_deployment; the default keeps a client that never creates a
+        # deployment addressing the version it always used.
+        self.crd_version: str = CRD_VERSION_V1ALPHA1
         self.deployment_spec: Optional[
             Dict[str, Any]
         ] = None  # Will store the full deployment spec
@@ -262,8 +322,9 @@ class DynamoDeploymentClient:
         ), "Failed to load deployment specification"
 
         # Extract component names (original case for label queries, lowercase for directories)
-        self._original_components = list(
-            self.deployment_spec["spec"]["services"].keys()
+        self.crd_version = detect_dgd_crd_version(self.deployment_spec)
+        self._original_components = extract_component_names(
+            self.deployment_spec, self.deployment_name
         )
         self.components = [svc.lower() for svc in self._original_components]
 
@@ -294,7 +355,7 @@ class DynamoDeploymentClient:
         try:
             await self.custom_api.create_namespaced_custom_object(
                 group="nvidia.com",
-                version="v1alpha1",
+                version=self.crd_version,
                 namespace=self.namespace,
                 plural="dynamographdeployments",
                 body=self.deployment_spec,
@@ -404,7 +465,7 @@ class DynamoDeploymentClient:
             try:
                 status = await self.custom_api.get_namespaced_custom_object(
                     group="nvidia.com",
-                    version="v1alpha1",
+                    version=self.crd_version,
                     namespace=self.namespace,
                     plural="dynamographdeployments",
                     name=self.deployment_name,
@@ -622,7 +683,7 @@ class DynamoDeploymentClient:
         try:
             await self.custom_api.delete_namespaced_custom_object(
                 group="nvidia.com",
-                version="v1alpha1",
+                version=self.crd_version,
                 namespace=self.namespace,
                 plural="dynamographdeployments",
                 name=self.deployment_name,

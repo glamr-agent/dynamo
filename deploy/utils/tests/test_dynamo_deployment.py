@@ -1,13 +1,20 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit test for the fail-fast behavior added for #9213.
+"""Unit tests for ``DynamoDeploymentClient``.
 
-When a candidate deployment's worker pods enter ``CrashLoopBackOff``,
+Fail-fast behavior added for #9213: when a candidate deployment's worker
+pods enter ``CrashLoopBackOff``,
 ``DynamoDeploymentClient.wait_for_deployment_ready`` must raise
 ``DeploymentFailedError`` immediately rather than waiting out the full
 ``timeout`` — otherwise the thorough-mode profiler burns up to 30 min
 of wall-clock per failing candidate.
+
+Schema handling: ``create_deployment`` is handed both DynamoGraphDeployment
+schemas — the profiler emits v1beta1 (``spec.components`` as a list), while
+the CLI and older manifests still use v1alpha1 (``spec.services`` as a
+mapping). It must read the component names out of either shape and address
+the CRD version the manifest declares.
 """
 
 from unittest.mock import AsyncMock, MagicMock
@@ -26,7 +33,7 @@ from deploy.utils.dynamo_deployment import (  # noqa: E402
     DynamoDeploymentClient,
 )
 
-pytestmark = pytest.mark.pre_merge
+pytestmark = [pytest.mark.pre_merge, pytest.mark.unit, pytest.mark.gpu_0]
 
 
 async def test_wait_for_deployment_ready_raises_deployment_failed_on_crashloop(
@@ -62,3 +69,69 @@ async def test_wait_for_deployment_ready_raises_deployment_failed_on_crashloop(
     # Confirm we didn't run out the timeout — there should have been at
     # most one DGD status check before the raise.
     assert client.custom_api.get_namespaced_custom_object.await_count == 1
+
+
+def _client_with_mocked_api(deployment_name: str) -> DynamoDeploymentClient:
+    """A client whose Kubernetes setup and API object are mocked out.
+
+    ``create_deployment`` calls ``_init_kubernetes`` first, so stubbing it
+    leaves the ``custom_api`` assigned here in place and the real parsing
+    path is still the one under test.
+    """
+    client = DynamoDeploymentClient(namespace="ns", deployment_name=deployment_name)
+    client._init_kubernetes = AsyncMock()  # type: ignore[method-assign]
+    client.custom_api = MagicMock()
+    client.custom_api.create_namespaced_custom_object = AsyncMock()
+    return client
+
+
+async def test_create_deployment_reads_v1beta1_components_list():
+    client = _client_with_mocked_api("dgd-v1beta1")
+    spec = {
+        "apiVersion": "nvidia.com/v1beta1",
+        "kind": "DynamoGraphDeployment",
+        "metadata": {"name": "dgd-v1beta1"},
+        "spec": {
+            "components": [
+                {"name": "Frontend", "replicas": 1},
+                {"name": "VllmPrefillWorker", "replicas": 2},
+            ]
+        },
+    }
+
+    await client.create_deployment(spec)
+
+    # These names are stamped onto the `nvidia.com/dynamo-component` pod
+    # label the log fetch and the terminal-failure check select on.
+    assert client._original_components == ["Frontend", "VllmPrefillWorker"]
+    # The lowercase derivative is what the log directory layout and
+    # `pick_decode_component` consume.
+    assert client.components == ["frontend", "vllmprefillworker"]
+
+    _, kwargs = client.custom_api.create_namespaced_custom_object.await_args
+    # The request path has to address the same version the body declares,
+    # or the API server rejects the create.
+    assert kwargs["version"] == "v1beta1"
+
+
+async def test_create_deployment_still_reads_v1alpha1_services_mapping():
+    client = _client_with_mocked_api("dgd-v1alpha1")
+    spec = {
+        "apiVersion": "nvidia.com/v1alpha1",
+        "kind": "DynamoGraphDeployment",
+        "metadata": {"name": "dgd-v1alpha1"},
+        "spec": {
+            "services": {
+                "Frontend": {"replicas": 1},
+                "VllmPrefillWorker": {"replicas": 2},
+            }
+        },
+    }
+
+    await client.create_deployment(spec)
+
+    assert client._original_components == ["Frontend", "VllmPrefillWorker"]
+    assert client.components == ["frontend", "vllmprefillworker"]
+
+    _, kwargs = client.custom_api.create_namespaced_custom_object.await_args
+    assert kwargs["version"] == "v1alpha1"
