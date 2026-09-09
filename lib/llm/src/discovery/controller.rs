@@ -24,6 +24,12 @@ use crate::{model_card::ModelDeploymentCard, namespace::NamespaceFilter};
 
 const DEFAULT_MAX_CONCURRENT_BUILDS: usize = 8;
 const RECONCILIATION_INTERVAL: Duration = Duration::from_secs(30);
+/// How long a discovery group keeps its commit after its last member leaves.
+///
+/// Observed removal-to-recommit gaps during a rolling update are around one
+/// second, so this leaves a wide margin while staying short against any
+/// deployment lifecycle.
+const DEFAULT_GROUP_REMOVAL_GRACE_MS: u64 = 5_000;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Ord, PartialOrd)]
 pub(crate) struct GroupKey {
@@ -122,6 +128,14 @@ enum GroupStatus {
         deadline: Instant,
     },
     Conflict,
+    /// The group has no members left but keeps its commit until `deadline`, so a
+    /// replacement generation that registers inside the window finds the model
+    /// still present instead of already gone.
+    Draining {
+        fingerprint: String,
+        committed_members: BTreeSet<String>,
+        deadline: Instant,
+    },
     Blocked {
         fingerprint: String,
         deadline: Instant,
@@ -198,6 +212,7 @@ pub(crate) struct ModelDiscoveryController<H: ControllerHost> {
     active_builds: usize,
     max_concurrent_builds: usize,
     next_build_generation: u64,
+    removal_grace: Duration,
 }
 
 impl<H: ControllerHost> ModelDiscoveryController<H> {
@@ -206,6 +221,15 @@ impl<H: ControllerHost> ModelDiscoveryController<H> {
     }
 
     fn with_max_concurrent_builds(host: Arc<H>, max_concurrent_builds: usize) -> Self {
+        Self::with_settings(host, max_concurrent_builds, configured_removal_grace())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_removal_grace(host: Arc<H>, removal_grace: Duration) -> Self {
+        Self::with_settings(host, DEFAULT_MAX_CONCURRENT_BUILDS, removal_grace)
+    }
+
+    fn with_settings(host: Arc<H>, max_concurrent_builds: usize, removal_grace: Duration) -> Self {
         Self {
             host,
             desired: HashMap::new(),
@@ -217,6 +241,7 @@ impl<H: ControllerHost> ModelDiscoveryController<H> {
             active_builds: 0,
             max_concurrent_builds: max_concurrent_builds.max(1),
             next_build_generation: 1,
+            removal_grace,
         }
     }
 
@@ -382,9 +407,31 @@ impl<H: ControllerHost> ModelDiscoveryController<H> {
         if group.cohorts.is_empty() {
             group.admission_tx.send_replace(Vec::new());
             cancel_build(&old_status);
-            if status_has_commit(&old_status) {
-                self.host.remove_group(key);
+            if self.removal_grace.is_zero() {
+                if status_has_commit(&old_status) {
+                    self.host.remove_group(key);
+                }
+                return;
             }
+            // A group that never committed has nothing to retain, so it is still
+            // dropped at once. One that did keeps its commit for the grace
+            // window: the model stays in the catalog and reports itself not
+            // ready, instead of vanishing and looking like it was never
+            // deployed while a replacement generation registers.
+            let Some((fingerprint, committed_members, previous_deadline)) =
+                committed_state(old_status)
+            else {
+                return;
+            };
+            group.status = GroupStatus::Draining {
+                fingerprint,
+                committed_members,
+                // Reconciling an already-draining group must not push its
+                // deadline out, or repeated churn would postpone the removal
+                // indefinitely.
+                deadline: previous_deadline.unwrap_or_else(|| Instant::now() + self.removal_grace),
+            };
+            self.groups.insert(key.clone(), group);
             return;
         }
 
@@ -413,7 +460,9 @@ impl<H: ControllerHost> ModelDiscoveryController<H> {
         let admitted = admitted_ids(&members);
         if !matches!(
             &old_status,
-            GroupStatus::Ready { .. } | GroupStatus::BlockedReady { .. }
+            GroupStatus::Ready { .. }
+                | GroupStatus::BlockedReady { .. }
+                | GroupStatus::Draining { .. }
         ) {
             group.admission_tx.send_replace(admitted);
         }
@@ -424,6 +473,11 @@ impl<H: ControllerHost> ModelDiscoveryController<H> {
                 committed_members,
             }
             | GroupStatus::BlockedReady {
+                fingerprint: ready_fingerprint,
+                committed_members,
+                ..
+            }
+            | GroupStatus::Draining {
                 fingerprint: ready_fingerprint,
                 committed_members,
                 ..
@@ -744,7 +798,8 @@ impl<H: ControllerHost> ModelDiscoveryController<H> {
             .filter_map(|group| match group.status {
                 GroupStatus::Retrying { deadline, .. }
                 | GroupStatus::Blocked { deadline, .. }
-                | GroupStatus::BlockedReady { deadline, .. } => Some(deadline),
+                | GroupStatus::BlockedReady { deadline, .. }
+                | GroupStatus::Draining { deadline, .. } => Some(deadline),
                 _ => None,
             })
             .min()
@@ -753,6 +808,7 @@ impl<H: ControllerHost> ModelDiscoveryController<H> {
     fn release_due_retries(&mut self) {
         let now = Instant::now();
         let mut retained_retries = Vec::new();
+        let mut expired_drains = Vec::new();
         for (key, group) in &mut self.groups {
             let (fingerprint, deadline) = match &group.status {
                 GroupStatus::Retrying {
@@ -775,6 +831,10 @@ impl<H: ControllerHost> ModelDiscoveryController<H> {
                     retained_retries.push(key.clone());
                     continue;
                 }
+                GroupStatus::Draining { deadline, .. } if *deadline <= now => {
+                    expired_drains.push(key.clone());
+                    continue;
+                }
                 _ => continue,
             };
             if *deadline <= now {
@@ -782,6 +842,14 @@ impl<H: ControllerHost> ModelDiscoveryController<H> {
                     fingerprint: fingerprint.clone(),
                 };
             }
+        }
+        for key in expired_drains {
+            tracing::info!(
+                group = %key.id(),
+                "Discovery-group removal grace elapsed with no replacement member; removing the group"
+            );
+            self.host.remove_group(&key);
+            self.groups.remove(&key);
         }
         for key in retained_retries {
             self.reconcile_group(&key, false);
@@ -891,8 +959,59 @@ fn cancel_build(status: &GroupStatus) {
 fn status_has_commit(status: &GroupStatus) -> bool {
     matches!(
         status,
-        GroupStatus::Ready { .. } | GroupStatus::BlockedReady { .. }
+        GroupStatus::Ready { .. } | GroupStatus::BlockedReady { .. } | GroupStatus::Draining { .. }
     )
+}
+
+/// The commit a status still owns, with the drain deadline it was already
+/// running under, if any.
+fn committed_state(status: GroupStatus) -> Option<(String, BTreeSet<String>, Option<Instant>)> {
+    match status {
+        GroupStatus::Ready {
+            fingerprint,
+            committed_members,
+        }
+        | GroupStatus::BlockedReady {
+            fingerprint,
+            committed_members,
+            ..
+        } => Some((fingerprint, committed_members, None)),
+        GroupStatus::Draining {
+            fingerprint,
+            committed_members,
+            deadline,
+        } => Some((fingerprint, committed_members, Some(deadline))),
+        _ => None,
+    }
+}
+
+fn configured_removal_grace() -> Duration {
+    removal_grace(
+        std::env::var("DYN_DISCOVERY_GROUP_REMOVAL_GRACE_MS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Parse the removal grace in milliseconds. `0` restores immediate removal.
+fn removal_grace(value: Option<&str>) -> Duration {
+    let millis = match value {
+        Some(value) => match value.parse::<u64>() {
+            Ok(millis) => millis,
+            Err(error) => {
+                tracing::warn!(
+                    env_var = "DYN_DISCOVERY_GROUP_REMOVAL_GRACE_MS",
+                    value,
+                    default = DEFAULT_GROUP_REMOVAL_GRACE_MS,
+                    %error,
+                    "Failed to parse the discovery-group removal grace; using default"
+                );
+                DEFAULT_GROUP_REMOVAL_GRACE_MS
+            }
+        },
+        None => DEFAULT_GROUP_REMOVAL_GRACE_MS,
+    };
+    Duration::from_millis(millis)
 }
 
 async fn wait_for_deadline(deadline: Option<Instant>) {
@@ -919,7 +1038,7 @@ mod tests {
     use super::*;
     use std::sync::{
         Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     };
     use tokio::sync::{Semaphore, mpsc};
 
@@ -937,6 +1056,10 @@ mod tests {
         adapter_projections: Mutex<HashMap<String, HashMap<String, String>>>,
         removed_groups: AtomicUsize,
         discarded: AtomicUsize,
+        /// Set whenever a removal leaves no committed group at all. That is the
+        /// state in which the frontend's catalog has no worker set for the
+        /// model and answers `404` rather than `503`.
+        held_no_commit: AtomicBool,
     }
 
     impl FakeHost {
@@ -955,6 +1078,7 @@ mod tests {
                     adapter_projections: Mutex::new(HashMap::new()),
                     removed_groups: AtomicUsize::new(0),
                     discarded: AtomicUsize::new(0),
+                    held_no_commit: AtomicBool::new(false),
                 }),
                 start_rx,
             )
@@ -1118,7 +1242,13 @@ mod tests {
         }
 
         fn remove_group(&self, key: &GroupKey) {
-            self.committed.lock().unwrap().remove(&key.id());
+            {
+                let mut committed = self.committed.lock().unwrap();
+                committed.remove(&key.id());
+                if committed.is_empty() {
+                    self.held_no_commit.store(true, Ordering::SeqCst);
+                }
+            }
             self.adapters.lock().unwrap().remove(&key.id());
             self.adapter_projections.lock().unwrap().remove(&key.id());
             self.removed_groups.fetch_add(1, Ordering::SeqCst);
@@ -1162,6 +1292,27 @@ mod tests {
             fingerprint: fingerprint.to_string(),
             projection_fingerprint: fingerprint.to_string(),
         }
+    }
+
+    fn replacement_group_key() -> GroupKey {
+        GroupKey {
+            model_name: "model".to_string(),
+            worker_set_key: "group-next".to_string(),
+        }
+    }
+
+    /// A member of a second discovery group, standing in for the replacement
+    /// generation of a rolling update. The operator gives each generation a new
+    /// runtime-namespace suffix, and the namespace is the first field of the
+    /// worker-set key, so the replacement lands in a different group than the
+    /// generation it replaces.
+    fn replacement_instance(id: u64, fingerprint: &str) -> DesiredInstance {
+        let mut replacement = instance(id, fingerprint);
+        replacement.mcid.namespace = "namespace-next".to_string();
+        replacement.endpoint_id.namespace = "namespace-next".to_string();
+        replacement.key = replacement.mcid.to_path();
+        replacement.group_key = replacement_group_key();
+        replacement
     }
 
     fn discovery_instance(instance: &DesiredInstance) -> DiscoveryInstance {
@@ -1296,6 +1447,129 @@ mod tests {
         assert_eq!(host.removed_groups.load(Ordering::SeqCst), 0);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn replacement_group_keeps_the_model_committed_across_the_handover() {
+        let (host, mut starts) = FakeHost::new();
+        let mut controller =
+            ModelDiscoveryController::with_removal_grace(host.clone(), Duration::from_millis(500));
+        let departing = instance(1, "spec");
+        controller.apply_added(departing.clone());
+        controller.start_queued_builds();
+        starts.recv().await.unwrap();
+        host.release.add_permits(1);
+        finish_build(&mut controller).await;
+        assert_eq!(
+            host.members(&group_key()),
+            BTreeSet::from([departing.key.clone()])
+        );
+
+        controller.apply_removed(&departing.key);
+        assert_eq!(
+            host.members(&group_key()),
+            BTreeSet::from([departing.key.clone()])
+        );
+        assert_eq!(host.removed_groups.load(Ordering::SeqCst), 0);
+
+        let replacement = replacement_instance(2, "spec");
+        controller.apply_added(replacement.clone());
+        controller.start_queued_builds();
+        starts.recv().await.unwrap();
+        host.release.add_permits(1);
+        finish_build(&mut controller).await;
+        assert_eq!(
+            host.members(&replacement_group_key()),
+            BTreeSet::from([replacement.key.clone()])
+        );
+
+        tokio::time::advance(Duration::from_millis(501)).await;
+        controller.release_due_retries();
+
+        assert!(host.members(&group_key()).is_empty());
+        assert_eq!(
+            host.members(&replacement_group_key()),
+            BTreeSet::from([replacement.key])
+        );
+        assert_eq!(host.removed_groups.load(Ordering::SeqCst), 1);
+        assert!(!host.held_no_commit.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn same_key_rejoin_cancels_the_pending_removal() {
+        let (host, mut starts) = FakeHost::new();
+        let mut controller =
+            ModelDiscoveryController::with_removal_grace(host.clone(), Duration::from_millis(500));
+        let departing = instance(1, "spec");
+        controller.apply_added(departing.clone());
+        controller.start_queued_builds();
+        starts.recv().await.unwrap();
+        host.release.add_permits(1);
+        finish_build(&mut controller).await;
+
+        controller.apply_removed(&departing.key);
+        let rejoined = instance(2, "spec");
+        controller.apply_added(rejoined.clone());
+
+        assert_eq!(
+            host.members(&group_key()),
+            BTreeSet::from([rejoined.key.clone()])
+        );
+        assert_eq!(host.removed_groups.load(Ordering::SeqCst), 0);
+        assert_eq!(host.starts.load(Ordering::SeqCst), 1);
+
+        tokio::time::advance(Duration::from_millis(501)).await;
+        controller.release_due_retries();
+        assert_eq!(host.members(&group_key()), BTreeSet::from([rejoined.key]));
+        assert_eq!(host.removed_groups.load(Ordering::SeqCst), 0);
+        assert!(!host.held_no_commit.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn group_that_stays_empty_is_removed_when_the_grace_elapses() {
+        let (host, mut starts) = FakeHost::new();
+        let mut controller =
+            ModelDiscoveryController::with_removal_grace(host.clone(), Duration::from_millis(500));
+        let only = instance(1, "spec");
+        controller.apply_added(only.clone());
+        controller.start_queued_builds();
+        starts.recv().await.unwrap();
+        host.release.add_permits(1);
+        finish_build(&mut controller).await;
+
+        controller.apply_removed(&only.key);
+        tokio::time::advance(Duration::from_millis(499)).await;
+        controller.release_due_retries();
+        assert_eq!(host.members(&group_key()), BTreeSet::from([only.key]));
+        assert_eq!(host.removed_groups.load(Ordering::SeqCst), 0);
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        controller.release_due_retries();
+        assert!(host.members(&group_key()).is_empty());
+        assert_eq!(host.removed_groups.load(Ordering::SeqCst), 1);
+        assert!(!controller.groups.contains_key(&group_key()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn zero_grace_removes_the_group_synchronously() {
+        let (host, mut starts) = FakeHost::new();
+        let mut controller =
+            ModelDiscoveryController::with_removal_grace(host.clone(), Duration::ZERO);
+        let only = instance(1, "spec");
+        controller.apply_added(only.clone());
+        controller.start_queued_builds();
+        starts.recv().await.unwrap();
+        host.release.add_permits(1);
+        finish_build(&mut controller).await;
+        assert_eq!(
+            host.members(&group_key()),
+            BTreeSet::from([only.key.clone()])
+        );
+
+        controller.apply_removed(&only.key);
+        assert!(host.members(&group_key()).is_empty());
+        assert_eq!(host.removed_groups.load(Ordering::SeqCst), 1);
+        assert!(!controller.groups.contains_key(&group_key()));
+    }
+
     #[tokio::test]
     async fn recreated_group_rejects_prepared_result_from_prior_lifetime() {
         let (host, mut starts) = FakeHost::new();
@@ -1324,10 +1598,11 @@ mod tests {
         assert_eq!(host.members(&group_key()), BTreeSet::from([first.key]));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn adapter_cards_neither_start_nor_keep_worker_sets_alive() {
         let (host, mut starts) = FakeHost::new();
-        let mut controller = ModelDiscoveryController::new(host.clone());
+        let mut controller =
+            ModelDiscoveryController::with_removal_grace(host.clone(), Duration::from_millis(500));
         let mut adapter = instance(1, "adapter-spec");
         adapter.mcid.model_suffix = Some("adapter".to_string());
         adapter.key = adapter.mcid.to_path();
@@ -1369,6 +1644,8 @@ mod tests {
         assert_eq!(host.starts.load(Ordering::SeqCst), 1);
 
         controller.apply_removed(&base.key);
+        tokio::time::advance(Duration::from_millis(501)).await;
+        controller.release_due_retries();
         assert!(host.members(&group_key()).is_empty());
         assert!(host.adapters(&group_key()).is_empty());
         assert!(controller.desired.contains_key(&adapter.key));

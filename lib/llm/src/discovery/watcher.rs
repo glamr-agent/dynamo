@@ -413,6 +413,32 @@ where
         discovery_stream: DiscoveryStream,
         namespace_filter: NamespaceFilter,
     ) {
+        let controller = ModelDiscoveryController::new(Arc::clone(&self));
+        self.run_controller(controller, discovery_stream, namespace_filter)
+            .await;
+    }
+
+    /// Run the controller with an explicit removal grace, so a test does not
+    /// have to wait out the default one.
+    #[cfg(test)]
+    pub(crate) async fn watch_with_removal_grace(
+        self: Arc<Self>,
+        discovery_stream: DiscoveryStream,
+        namespace_filter: NamespaceFilter,
+        removal_grace: Duration,
+    ) {
+        let controller =
+            ModelDiscoveryController::with_removal_grace(Arc::clone(&self), removal_grace);
+        self.run_controller(controller, discovery_stream, namespace_filter)
+            .await;
+    }
+
+    async fn run_controller(
+        self: Arc<Self>,
+        controller: ModelDiscoveryController<Self>,
+        discovery_stream: DiscoveryStream,
+        namespace_filter: NamespaceFilter,
+    ) {
         let dispatch_handle = self.model_update_tx.clone().map(|external_tx| {
             let (dispatch_tx, mut dispatch_rx) = tokio::sync::mpsc::unbounded_channel();
             *self.model_update_dispatch.lock() = Some(dispatch_tx);
@@ -425,9 +451,7 @@ where
             })
         });
 
-        ModelDiscoveryController::new(Arc::clone(&self))
-            .run(discovery_stream, namespace_filter)
-            .await;
+        controller.run(discovery_stream, namespace_filter).await;
 
         self.model_update_dispatch.lock().take();
         if let Some(mut dispatch_handle) = dispatch_handle
@@ -1686,11 +1710,11 @@ mod tests {
             receiver.recv().await.map(|event| (event, receiver))
         })
         .boxed();
-        let watch_task = tokio::spawn(
-            watcher
-                .clone()
-                .watch(stream, NamespaceFilter::Exact(base_mcid.namespace.clone())),
-        );
+        let watch_task = tokio::spawn(watcher.clone().watch_with_removal_grace(
+            stream,
+            NamespaceFilter::Exact(base_mcid.namespace.clone()),
+            Duration::from_millis(50),
+        ));
         event_tx
             .send(Ok(DiscoveryEvent::Added(instance(&base_mcid, &base_card))))
             .unwrap();
