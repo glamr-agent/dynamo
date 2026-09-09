@@ -90,22 +90,32 @@ def extract_component_names(
     The names are returned with their original casing because the operator
     stamps them verbatim onto the `nvidia.com/dynamo-component` pod label,
     which is what the log fetch and the terminal-failure check select on.
+
+    An empty result is raised on rather than returned. `_detect_terminal_pod_failure`
+    short-circuits when `_original_components` is empty, so handing back `[]` for a
+    manifest with no usable component names would silently disable the
+    CrashLoopBackOff fail-fast and make a broken candidate wait out the whole
+    deployment timeout. Failing here keeps that case as loud as the
+    pre-migration `KeyError` was.
     """
     spec = deployment_spec.get("spec") or {}
     components = spec.get("components")
     if isinstance(components, list):
-        return [
+        names = [
             component["name"]
             for component in components
             if isinstance(component, dict) and component.get("name")
         ]
+        if names:
+            return names
     services = spec.get("services")
-    if isinstance(services, dict):
+    if isinstance(services, dict) and services:
         return list(services.keys())
     raise ValueError(
-        f"DynamoGraphDeployment '{deployment_name}' declares no components: "
-        "expected a list under 'spec.components' (v1beta1) or a mapping under "
-        "'spec.services' (v1alpha1)"
+        f"DynamoGraphDeployment '{deployment_name}' declares no named components: "
+        "expected a non-empty list under 'spec.components' whose entries each "
+        "carry a 'name' (v1beta1), or a non-empty mapping under 'spec.services' "
+        "(v1alpha1)"
     )
 
 

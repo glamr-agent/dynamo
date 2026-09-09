@@ -15,6 +15,11 @@ schemas — the profiler emits v1beta1 (``spec.components`` as a list), while
 the CLI and older manifests still use v1alpha1 (``spec.services`` as a
 mapping). It must read the component names out of either shape and address
 the CRD version the manifest declares.
+
+The v1beta1 case is driven through ``create_deployment`` because that is the
+path that used to raise ``KeyError: 'services'``. The v1alpha1 and
+empty-manifest cases are driven through ``extract_component_names`` and
+``detect_dgd_crd_version`` directly — see the comment above them.
 """
 
 from unittest.mock import AsyncMock, MagicMock
@@ -31,6 +36,8 @@ pytest.importorskip("httpx")
 from deploy.utils.dynamo_deployment import (  # noqa: E402
     DeploymentFailedError,
     DynamoDeploymentClient,
+    detect_dgd_crd_version,
+    extract_component_names,
 )
 
 pytestmark = [pytest.mark.pre_merge, pytest.mark.unit, pytest.mark.gpu_0]
@@ -114,24 +121,59 @@ async def test_create_deployment_reads_v1beta1_components_list():
     assert kwargs["version"] == "v1beta1"
 
 
-async def test_create_deployment_still_reads_v1alpha1_services_mapping():
-    client = _client_with_mocked_api("dgd-v1alpha1")
-    spec = {
-        "apiVersion": "nvidia.com/v1alpha1",
-        "kind": "DynamoGraphDeployment",
-        "metadata": {"name": "dgd-v1alpha1"},
-        "spec": {
-            "services": {
-                "Frontend": {"replicas": 1},
-                "VllmPrefillWorker": {"replicas": 2},
+# The v1alpha1 cases below drive the two helpers directly rather than going
+# through `create_deployment`. Routing them through the client would assert
+# only behavior the pre-migration code already had — v1alpha1 is the shape it
+# was written for — so such a test passes with or without this change and
+# proves nothing. The helpers are new, so a test against them fails on the old
+# file (the symbols do not exist) and pins the v1alpha1 branch that the rewrite
+# had to preserve.
+
+
+def test_extract_component_names_reads_v1alpha1_services_mapping():
+    names = extract_component_names(
+        {
+            "spec": {
+                "services": {
+                    "Frontend": {"replicas": 1},
+                    "VllmPrefillWorker": {"replicas": 2},
+                }
             }
         },
-    }
+        "dgd-v1alpha1",
+    )
 
-    await client.create_deployment(spec)
+    assert names == ["Frontend", "VllmPrefillWorker"]
 
-    assert client._original_components == ["Frontend", "VllmPrefillWorker"]
-    assert client.components == ["frontend", "vllmprefillworker"]
 
-    _, kwargs = client.custom_api.create_namespaced_custom_object.await_args
-    assert kwargs["version"] == "v1alpha1"
+def test_detect_dgd_crd_version_trusts_api_version():
+    assert detect_dgd_crd_version({"apiVersion": "nvidia.com/v1alpha1"}) == "v1alpha1"
+    assert detect_dgd_crd_version({"apiVersion": "nvidia.com/v1beta1"}) == "v1beta1"
+
+
+def test_detect_dgd_crd_version_falls_back_to_spec_shape():
+    # No `apiVersion` at all: a list under `spec.components` is the v1beta1
+    # shape, a `spec.services` mapping is v1alpha1. `main()` accepts an
+    # arbitrary YAML file, which is where an unlabelled manifest comes from.
+    assert detect_dgd_crd_version({"spec": {"components": []}}) == "v1beta1"
+    assert detect_dgd_crd_version({"spec": {"services": {}}}) == "v1alpha1"
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        pytest.param({"components": []}, id="empty-components-list"),
+        pytest.param({"components": [{"replicas": 1}]}, id="components-without-name"),
+        pytest.param({"services": {}}, id="empty-services-mapping"),
+        pytest.param({}, id="neither-field"),
+    ],
+)
+def test_extract_component_names_raises_when_no_names_resolve(spec):
+    # Returning [] here would be worse than raising: `_detect_terminal_pod_failure`
+    # returns None on an empty `_original_components`, so the CrashLoopBackOff
+    # fail-fast that the first test in this module guards would silently switch
+    # off and a broken candidate would wait out the full deployment timeout.
+    with pytest.raises(ValueError) as excinfo:
+        extract_component_names({"spec": spec}, "dgd-empty")
+
+    assert "dgd-empty" in str(excinfo.value)
