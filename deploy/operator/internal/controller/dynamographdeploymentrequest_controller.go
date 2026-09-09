@@ -24,6 +24,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"text/template"
 
@@ -84,6 +85,12 @@ const (
 
 	// Sidecar image
 	SidecarImage = "bitnami/kubectl:latest"
+
+	// How long the output copier tolerates continuously failing kubectl calls before
+	// it gives up and exits non-zero. Long enough to ride out API throttling or a
+	// brief apiserver blip, short enough that a permanently broken sidecar surfaces
+	// as a failed DGDR instead of hanging in Profiling forever.
+	outputCopierKubectlFailureDeadlineSeconds = 300
 
 	// Volume names
 	VolumeNameProfilingOutput            = "profiling-output"
@@ -151,11 +158,50 @@ const sidecarScriptTemplate = `
 set -e
 set -o pipefail
 
+# Preflight: the sidecar is useless without kubectl. Its only two jobs -- noticing
+# that the profiler container terminated, and writing results back to the output
+# ConfigMap -- both go through the API server. Without kubectl the poll loop below
+# would spin on "sleep 10" forever, the pod would never reach a terminal phase, and
+# the DGDR would stay in Profiling indefinitely. Fail loudly instead: a non-zero exit
+# lets the Job report JobFailed, which the controller turns into DGDRPhaseFailed with
+# these lines scraped from the pod log into the condition message.
+if ! command -v kubectl >/dev/null 2>&1; then
+  echo "ERROR: kubectl was not found in the output-copier image." >&2
+  echo "ERROR: The output-copier sidecar needs kubectl to detect profiler termination and to write results to ConfigMap {{.ConfigMapName}}." >&2
+  echo "ERROR: Override the output-copier image under spec.overrides.profilingJob with an image that provides kubectl." >&2
+  exit 1
+fi
+
 STATUS_FILE="{{.OutputPath}}/profiler_status.yaml"
 LAST_PHASE=""
 START_TIME=$(date +%s)
 LAST_PROGRESS_LOG=$START_TIME
 PROGRESS_INTERVAL=300
+
+# A kubectl that exists but always fails (revoked RBAC, unreachable API server) hangs
+# the loop just as badly as a missing binary. Track how long kubectl has been failing
+# continuously and give up once the window exceeds the deadline. Any success resets
+# the window, so genuine transients stay tolerated.
+KUBECTL_FAILURE_DEADLINE={{.KubectlFailureDeadlineSeconds}}
+KUBECTL_FIRST_FAILURE=0
+
+note_kubectl_success() {
+  KUBECTL_FIRST_FAILURE=0
+}
+
+note_kubectl_failure() {
+  NOW=$(date +%s)
+  if [ "$KUBECTL_FIRST_FAILURE" -eq 0 ]; then
+    KUBECTL_FIRST_FAILURE=$NOW
+  fi
+  FAILING_FOR=$((NOW - KUBECTL_FIRST_FAILURE))
+  if [ "$FAILING_FOR" -ge "$KUBECTL_FAILURE_DEADLINE" ]; then
+    echo "ERROR: kubectl has been failing continuously for ${FAILING_FOR}s (deadline ${KUBECTL_FAILURE_DEADLINE}s)." >&2
+    echo "ERROR: The output-copier sidecar cannot reach the Kubernetes API server, so it can neither detect profiler termination nor write results to ConfigMap {{.ConfigMapName}}." >&2
+    echo "ERROR: Check the profiling job ServiceAccount's RBAC and the API server's reachability from this pod." >&2
+    exit 1
+  fi
+}
 
 # relay_phase: read phase+message from profiler_status.yaml and write to ConfigMap.
 # Only writes when the phase changes (debounce).
@@ -190,7 +236,13 @@ data:
   phase: "$PHASE"
   message: "$MESSAGE"
 PEOF
-  kubectl apply -f /tmp/progress.yaml 2>/dev/null && LAST_PHASE="$PHASE" || echo "Warning: failed to update progress ConfigMap"
+  if kubectl apply -f /tmp/progress.yaml; then
+    LAST_PHASE="$PHASE"
+    note_kubectl_success
+  else
+    echo "Warning: failed to update progress ConfigMap {{.ConfigMapName}}" >&2
+    note_kubectl_failure
+  fi
 }
 
 # Main loop: poll profiler_status.yaml and wait for profiler to terminate
@@ -209,7 +261,13 @@ while true; do
   fi
 
   # Check if profiler container terminated
-  CONTAINER_STATUS=$(kubectl get pod $HOSTNAME -n {{.Namespace}} -o jsonpath='{.status.containerStatuses[?(@.name=="profiler")].state}' 2>/dev/null || echo "")
+  if CONTAINER_STATUS=$(kubectl get pod $HOSTNAME -n {{.Namespace}} -o jsonpath='{.status.containerStatuses[?(@.name=="profiler")].state}'); then
+    note_kubectl_success
+  else
+    echo "Warning: failed to read the profiler container's status from the API server" >&2
+    CONTAINER_STATUS=""
+    note_kubectl_failure
+  fi
   if echo "$CONTAINER_STATUS" | grep -q "terminated"; then
     echo "Profiler terminated (ran for $(($ELAPSED / 60)) minutes)"
     break
@@ -340,6 +398,24 @@ fi
 kubectl apply -f /tmp/cm.yaml
 echo "Saved profiling output to ConfigMap {{.ConfigMapName}}"
 `
+
+// renderSidecarScript renders sidecarScriptTemplate with the supplied template data.
+// The result becomes the output copier container's single shell argument. Extracted
+// from the job builder so tests can render and execute the production template rather
+// than a copy of it.
+func renderSidecarScript(data map[string]string) (string, error) {
+	tmpl, err := template.New("sidecar").Parse(sidecarScriptTemplate)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse sidecar script template: %w", err)
+	}
+
+	var scriptBuf bytes.Buffer
+	if err := tmpl.Execute(&scriptBuf, data); err != nil {
+		return "", fmt.Errorf("failed to execute sidecar script template: %w", err)
+	}
+
+	return scriptBuf.String(), nil
+}
 
 // profilingPhaseReason returns the condition Reason for a profiling sub-phase.
 // By design, the ProfilingPhase string values are identical to the Reason values
@@ -1544,29 +1620,24 @@ func (r *DynamoGraphDeploymentRequestReconciler) createProfilingJob(ctx context.
 		dynamo.AddStandardEnvVars(&profilerContainer, r.Config)
 
 		// Generate sidecar script from template
-		tmpl, err := template.New("sidecar").Parse(sidecarScriptTemplate)
-		if err != nil {
-			return nil, false, fmt.Errorf("failed to parse sidecar script template: %w", err)
-		}
-
-		var scriptBuf bytes.Buffer
-		err = tmpl.Execute(&scriptBuf, map[string]string{
-			"OutputPath":    ProfilingOutputPath,
-			"OutputFile":    ProfilingOutputFile,
-			"ConfigMapName": outputConfigMapName,
-			"Namespace":     dgdr.Namespace,
-			"DGDRName":      dgdr.Name,
-			"DGDRuid":       string(dgdr.UID),
+		sidecarScript, err := renderSidecarScript(map[string]string{
+			"OutputPath":                    ProfilingOutputPath,
+			"OutputFile":                    ProfilingOutputFile,
+			"ConfigMapName":                 outputConfigMapName,
+			"Namespace":                     dgdr.Namespace,
+			"DGDRName":                      dgdr.Name,
+			"DGDRuid":                       string(dgdr.UID),
+			"KubectlFailureDeadlineSeconds": strconv.Itoa(outputCopierKubectlFailureDeadlineSeconds),
 		})
 		if err != nil {
-			return nil, false, fmt.Errorf("failed to execute sidecar script template: %w", err)
+			return nil, false, err
 		}
 
 		sidecarContainer := corev1.Container{
 			Name:    ContainerNameOutputCopier,
 			Image:   SidecarImage,
 			Command: []string{"/bin/sh", "-c"},
-			Args:    []string{scriptBuf.String()},
+			Args:    []string{sidecarScript},
 			VolumeMounts: []corev1.VolumeMount{{
 				Name:      VolumeNameProfilingOutput,
 				MountPath: ProfilingOutputPath,
