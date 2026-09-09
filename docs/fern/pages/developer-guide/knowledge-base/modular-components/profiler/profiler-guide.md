@@ -688,12 +688,20 @@ utilities used by the sidecar script: `grep`, `awk`, `tr`, `sed`, `date`, `cat`,
 controller-owned mounts such as `profiling-output` at `/data` stay intact.
 
 The sidecar checks for `kubectl` before it starts polling. An image without it exits
-immediately with an `ERROR:` line naming the missing binary, which drives the
-`DynamoGraphDeploymentRequest` to `Failed` with that reason in its conditions instead of
-leaving it in `Profiling`. The sidecar also gives up if `kubectl` is present but every
-call keeps failing for five minutes — a revoked ServiceAccount RBAC binding or an
-unreachable API server — while still tolerating brief transient failures. Read either
-diagnostic with `kubectl describe dgdr <name> -n $NAMESPACE`.
+immediately with an `ERROR:` line naming the missing binary, which lets the profiling job
+fail and drives the `DynamoGraphDeploymentRequest` to `Failed` instead of leaving it in
+`Profiling`. The sidecar also gives up if `kubectl` is present but every call keeps
+failing for five minutes — a revoked ServiceAccount RBAC binding or an unreachable API
+server — while still tolerating brief transient failures.
+
+Both diagnostics stay in the sidecar's own container log. The request's conditions report
+the profiler container's exit code rather than the sidecar's message, so read the
+`ERROR:` line from the profiling job, which is named `profile-` followed by the request
+name:
+
+```bash
+kubectl logs job/profile-<name> -c output-copier -n $NAMESPACE
+```
 
 **ConfigMaps:**
 - `dgdr-output-<name>`: Generated DGD configuration

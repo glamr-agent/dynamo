@@ -163,8 +163,10 @@ set -o pipefail
 # ConfigMap -- both go through the API server. Without kubectl the poll loop below
 # would spin on "sleep 10" forever, the pod would never reach a terminal phase, and
 # the DGDR would stay in Profiling indefinitely. Fail loudly instead: a non-zero exit
-# lets the Job report JobFailed, which the controller turns into DGDRPhaseFailed with
-# these lines scraped from the pod log into the condition message.
+# lets the pod reach a terminal phase, so the Job reports JobFailed and the controller
+# sets DGDRPhaseFailed. These ERROR lines stay in this container's log -- nothing reads
+# them into the DGDR condition, whose message getProfilingJobErrorDetails builds from
+# the profiler container's exit code.
 if ! command -v kubectl >/dev/null 2>&1; then
   echo "ERROR: kubectl was not found in the output-copier image." >&2
   echo "ERROR: The output-copier sidecar needs kubectl to detect profiler termination and to write results to ConfigMap {{.ConfigMapName}}." >&2

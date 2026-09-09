@@ -205,7 +205,7 @@ func TestOutputCopierScriptFailsFastWhenKubectlIsMissing(t *testing.T) {
 		t.Fatalf("the sidecar exited 0 without kubectl, which the controller reads as a recorded profiler failure. output:\n%s", output)
 	}
 
-	t.Log("The diagnostic must reach the pod log, because the controller folds it into the DGDR condition")
+	t.Log("The diagnostic must name kubectl, because this container's log is the only place a user can read why it gave up")
 	if !strings.Contains(output, "kubectl") {
 		t.Errorf("the sidecar exited without naming kubectl in its output:\n%s", output)
 	}
