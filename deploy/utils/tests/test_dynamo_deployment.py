@@ -121,13 +121,8 @@ async def test_create_deployment_reads_v1beta1_components_list():
     assert kwargs["version"] == "v1beta1"
 
 
-# The v1alpha1 cases below drive the two helpers directly rather than going
-# through `create_deployment`. Routing them through the client would assert
-# only behavior the pre-migration code already had — v1alpha1 is the shape it
-# was written for — so such a test passes with or without this change and
-# proves nothing. The helpers are new, so a test against them fails on the old
-# file (the symbols do not exist) and pins the v1alpha1 branch that the rewrite
-# had to preserve.
+# The v1alpha1 cases below call the helpers directly; driving them through
+# `create_deployment` would pin no branch that these helpers introduced.
 
 
 def test_extract_component_names_reads_v1alpha1_services_mapping():
@@ -152,9 +147,8 @@ def test_detect_dgd_crd_version_trusts_api_version():
 
 
 def test_detect_dgd_crd_version_falls_back_to_spec_shape():
-    # No `apiVersion` at all: a list under `spec.components` is the v1beta1
-    # shape, a `spec.services` mapping is v1alpha1. `main()` accepts an
-    # arbitrary YAML file, which is where an unlabelled manifest comes from.
+    # Unlabelled manifests are real: `main()` accepts an arbitrary YAML file,
+    # so the spec shape has to decide when `apiVersion` is absent.
     assert detect_dgd_crd_version({"spec": {"components": []}}) == "v1beta1"
     assert detect_dgd_crd_version({"spec": {"services": {}}}) == "v1alpha1"
 
@@ -169,10 +163,8 @@ def test_detect_dgd_crd_version_falls_back_to_spec_shape():
     ],
 )
 def test_extract_component_names_raises_when_no_names_resolve(spec):
-    # Returning [] here would be worse than raising: `_detect_terminal_pod_failure`
-    # returns None on an empty `_original_components`, so the CrashLoopBackOff
-    # fail-fast that the first test in this module guards would silently switch
-    # off and a broken candidate would wait out the full deployment timeout.
+    # Returning [] instead of raising would silently disable the CrashLoopBackOff
+    # fail-fast, which skips out on an empty `_original_components`.
     with pytest.raises(ValueError) as excinfo:
         extract_component_names({"spec": spec}, "dgd-empty")
 

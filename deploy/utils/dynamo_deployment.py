@@ -43,12 +43,8 @@ TERMINAL_POD_WAITING_REASONS: frozenset[str] = frozenset(
     }
 )
 
-# The DynamoGraphDeployment CRD still serves both versions, and they name
-# their components differently: v1alpha1 keys them in a mapping under
-# `spec.services`, v1beta1 lists them as objects under `spec.components`,
-# each carrying its own `name`. This client is handed both shapes — the
-# profiler emits v1beta1 and `main()` below accepts an arbitrary YAML file —
-# so it detects the schema rather than assuming one.
+# v1alpha1 keys components in a `spec.services` mapping; v1beta1 lists them
+# under `spec.components`, each with its own `name`. Both shapes reach here.
 CRD_VERSION_V1ALPHA1 = "v1alpha1"
 CRD_VERSION_V1BETA1 = "v1beta1"
 
@@ -207,9 +203,8 @@ class DynamoDeploymentClient:
         self.service_name = service_name or f"{self.deployment_name}-frontend"
         self.components: List[str] = []  # Will store component names from CR
         self._original_components: List[str] = []
-        # Replaced with the version detected from the manifest in
-        # create_deployment; the default keeps a client that never creates a
-        # deployment addressing the version it always used.
+        # create_deployment overwrites this from the manifest; the default
+        # keeps a client that never creates a deployment on v1alpha1.
         self.crd_version: str = CRD_VERSION_V1ALPHA1
         self.deployment_spec: Optional[
             Dict[str, Any]
