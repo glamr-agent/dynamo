@@ -32,12 +32,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
-// TestGroveRenderPreservesTopologyConstraintOnReplicaChange renders an existing
-// constrained PodCliqueSet again after only a component replica count changed,
-// which is the shape a `replicas` JSON patch against a running
-// DynamoGraphDeployment produces. Horizontal changes reach Grove through the
-// generated child's scale subresource, so the re-render must leave both the
-// recorded topology constraint and the PodCliqueSet template replicas alone.
+// TestGroveRenderPreservesTopologyConstraintOnReplicaChange re-renders after a replica-count
+// change: scaling goes via the child's scale subresource, so constraint and template replicas hold.
 func TestGroveRenderPreservesTopologyConstraintOnReplicaChange(t *testing.T) {
 	ctx := context.Background()
 	tests := map[string]struct {
