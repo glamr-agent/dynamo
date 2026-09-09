@@ -413,11 +413,8 @@ impl<H: ControllerHost> ModelDiscoveryController<H> {
                 }
                 return;
             }
-            // A group that never committed has nothing to retain, so it is still
-            // dropped at once. One that did keeps its commit for the grace
-            // window: the model stays in the catalog and reports itself not
-            // ready, instead of vanishing and looking like it was never
-            // deployed while a replacement generation registers.
+            // Holding the commit keeps the model in the catalog and not ready,
+            // rather than gone, while a replacement generation registers.
             let Some((fingerprint, committed_members, previous_deadline)) =
                 committed_state(old_status)
             else {
@@ -426,9 +423,8 @@ impl<H: ControllerHost> ModelDiscoveryController<H> {
             group.status = GroupStatus::Draining {
                 fingerprint,
                 committed_members,
-                // Reconciling an already-draining group must not push its
-                // deadline out, or repeated churn would postpone the removal
-                // indefinitely.
+                // Reusing the existing deadline stops repeated churn from
+                // postponing removal indefinitely.
                 deadline: previous_deadline.unwrap_or_else(|| Instant::now() + self.removal_grace),
             };
             self.groups.insert(key.clone(), group);
