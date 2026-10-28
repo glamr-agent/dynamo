@@ -248,6 +248,47 @@ pub fn client_tls_config(
     Ok(config)
 }
 
+/// Build an optional client `TlsConnector` for a TCP transport from the
+/// `DYN_TCP_TLS_*` client settings.
+///
+/// Returns `None` when no TLS is requested (no CA, not insecure, no client
+/// identity). Otherwise fails closed on incomplete settings: a lone client
+/// cert or key, or TLS without a CA unless `insecure` is set. `transport`
+/// names the caller in the missing-CA error, e.g. `"Request plane TLS"`.
+pub(crate) fn optional_client_tls_connector(
+    transport: &str,
+    ca_cert_path: Option<&Path>,
+    insecure: bool,
+    client_cert: Option<&Path>,
+    client_key: Option<&Path>,
+) -> Result<Option<tokio_rustls::TlsConnector>> {
+    let tls_requested =
+        ca_cert_path.is_some() || insecure || client_cert.is_some() || client_key.is_some();
+    if !tls_requested {
+        return Ok(None);
+    }
+    use crate::config::environment_names::tcp_response_stream::tls as env;
+    // Validate the client identity pair before the CA check so a lone cert/key
+    // produces the accurate "set both" error rather than a misleading CA error.
+    if client_cert.is_some() != client_key.is_some() {
+        anyhow::bail!(
+            "both {} and {} must be set together to present a client identity",
+            env::DYN_TCP_TLS_CLIENT_CERT_PATH,
+            env::DYN_TCP_TLS_CLIENT_KEY_PATH,
+        );
+    }
+    if !insecure && ca_cert_path.is_none() {
+        anyhow::bail!(
+            "{transport} is enabled but {} is not set and {} is not true; \
+             provide a CA cert or set insecure mode for development",
+            env::DYN_TCP_TLS_CA_CERT_PATH,
+            env::DYN_TCP_TLS_INSECURE,
+        );
+    }
+    let tls_config = client_tls_config(ca_cert_path, insecure, client_cert, client_key)?;
+    Ok(Some(tokio_rustls::TlsConnector::from(Arc::new(tls_config))))
+}
+
 /// Load a leaf certificate chain + private key from PEM bytes into a rustls
 /// [`CertifiedKey`], validating that the certificate and key match.
 fn load_certified_key(cert_pem: &[u8], key_pem: &[u8]) -> Result<CertifiedKey> {
@@ -739,6 +780,43 @@ mod tests {
         assert_eq!(
             before, after,
             "a failed reload must keep serving the previously loaded certificate"
+        );
+    }
+
+    #[test]
+    fn optional_client_tls_connector_checks_order_and_label() {
+        let (cert, key) = test_certs::self_signed_pair();
+        assert!(
+            optional_client_tls_connector("Test TLS", None, false, None, None)
+                .unwrap()
+                .is_none()
+        );
+        // A lone cert or key with no CA reports the pair error, not the CA error.
+        for (c, k) in [(Some(cert.path()), None), (None, Some(key.path()))] {
+            let err = optional_client_tls_connector("Test TLS", None, false, c, k)
+                .err()
+                .expect("a lone client cert or key must be rejected")
+                .to_string();
+            assert!(err.contains("must be set together"), "{err}");
+        }
+        let err = optional_client_tls_connector(
+            "Test TLS",
+            None,
+            false,
+            Some(cert.path()),
+            Some(key.path()),
+        )
+        .err()
+        .expect("client identity without a CA must be rejected")
+        .to_string();
+        assert!(
+            err.starts_with("Test TLS is enabled but DYN_TCP_TLS_CA_CERT_PATH is not set"),
+            "{err}"
+        );
+        assert!(
+            optional_client_tls_connector("Test TLS", Some(cert.path()), false, None, None)
+                .unwrap()
+                .is_some()
         );
     }
 

@@ -317,9 +317,15 @@ fn build_tls_connector_from_env() -> anyhow::Result<Option<TlsConnector>> {
     let client_cert = std::env::var(env::DYN_TCP_TLS_CLIENT_CERT_PATH).ok();
     let client_key = std::env::var(env::DYN_TCP_TLS_CLIENT_KEY_PATH).ok();
 
-    let tls_requested =
-        ca_cert_path.is_some() || insecure || client_cert.is_some() || client_key.is_some();
-    if !tls_requested {
+    let connector = crate::tls_utils::optional_client_tls_connector(
+        "TCP TLS",
+        ca_cert_path.as_deref().map(std::path::Path::new),
+        insecure,
+        client_cert.as_deref().map(std::path::Path::new),
+        client_key.as_deref().map(std::path::Path::new),
+    )?;
+    // `None` means no client TLS was requested.
+    if connector.is_none() {
         // Warn if the server side has TLS configured — a plaintext client connecting to a
         // TLS server will fail with an opaque framing error rather than a clear TLS error.
         let server_tls_set = std::env::var(env::DYN_TCP_TLS_CERT_PATH).is_ok();
@@ -332,33 +338,8 @@ fn build_tls_connector_from_env() -> anyhow::Result<Option<TlsConnector>> {
                 env::DYN_TCP_TLS_INSECURE,
             );
         }
-        return Ok(None);
     }
-    // Validate the client identity pair before the CA check so a lone cert/key
-    // produces the accurate "set both" error rather than a misleading CA error.
-    if client_cert.is_some() != client_key.is_some() {
-        anyhow::bail!(
-            "both {} and {} must be set together to present a client identity",
-            env::DYN_TCP_TLS_CLIENT_CERT_PATH,
-            env::DYN_TCP_TLS_CLIENT_KEY_PATH,
-        );
-    }
-    if !insecure && ca_cert_path.is_none() {
-        anyhow::bail!(
-            "TCP TLS is enabled but {} is not set and {} is not true; \
-             provide a CA cert or set insecure mode for development",
-            env::DYN_TCP_TLS_CA_CERT_PATH,
-            env::DYN_TCP_TLS_INSECURE,
-        );
-    }
-
-    let tls_config = crate::tls_utils::client_tls_config(
-        ca_cert_path.as_deref().map(std::path::Path::new),
-        insecure,
-        client_cert.as_deref().map(std::path::Path::new),
-        client_key.as_deref().map(std::path::Path::new),
-    )?;
-    Ok(Some(TlsConnector::from(Arc::new(tls_config))))
+    Ok(connector)
 }
 
 /// Extract the TLS `ServerName` for an outbound connection.

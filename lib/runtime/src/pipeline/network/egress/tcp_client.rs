@@ -421,32 +421,13 @@ fn build_request_plane_tls_connector(
     client_cert: Option<&std::path::Path>,
     client_key: Option<&std::path::Path>,
 ) -> anyhow::Result<Option<TlsConnector>> {
-    let tls_requested =
-        ca_cert_path.is_some() || insecure || client_cert.is_some() || client_key.is_some();
-    if !tls_requested {
-        return Ok(None);
-    }
-    use crate::config::environment_names::tcp_response_stream::tls as env;
-    // Validate the client identity pair before the CA check so a lone cert/key
-    // produces the accurate "set both" error rather than a misleading CA error.
-    if client_cert.is_some() != client_key.is_some() {
-        anyhow::bail!(
-            "both {} and {} must be set together to present a client identity",
-            env::DYN_TCP_TLS_CLIENT_CERT_PATH,
-            env::DYN_TCP_TLS_CLIENT_KEY_PATH,
-        );
-    }
-    if !insecure && ca_cert_path.is_none() {
-        anyhow::bail!(
-            "Request plane TLS is enabled but {} is not set and {} is not true; \
-             provide a CA cert or set insecure mode for development",
-            env::DYN_TCP_TLS_CA_CERT_PATH,
-            env::DYN_TCP_TLS_INSECURE,
-        );
-    }
-    let tls_config =
-        crate::tls_utils::client_tls_config(ca_cert_path, insecure, client_cert, client_key)?;
-    Ok(Some(TlsConnector::from(std::sync::Arc::new(tls_config))))
+    crate::tls_utils::optional_client_tls_connector(
+        "Request plane TLS",
+        ca_cert_path,
+        insecure,
+        client_cert,
+        client_key,
+    )
 }
 
 impl Drop for TcpConnection {
