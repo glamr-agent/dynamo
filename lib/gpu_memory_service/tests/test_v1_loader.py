@@ -387,3 +387,125 @@ def test_mx_restore_retries_the_next_source_on_its_listen_port(monkeypatch):
     assert tried == [("peer-0", 25557), ("peer-1", 25557)]
     assert [agent.port for agent in agents] == [25557, 25557]
     assert all(agent.shut_down for agent in agents)
+
+
+class _CatalogAgent:
+    """A NIXL manager that runs ModelExpress's real tensor matching."""
+
+    def __init__(self, port: int) -> None:
+        from modelexpress.nixl_transfer import NixlTransferManager
+
+        self.port = port
+        self.prepared: list = []
+        self.tensor_descriptors: list = []
+        self._tensors: dict = {}
+        self._device_id = 0
+        self._backends = ["UCX"]
+        self._accelerator_backend = SimpleNamespace(
+            set_device=lambda _device: None, nixl_mem_type="VRAM"
+        )
+        self._agent = SimpleNamespace(
+            prep_xfer_dlist=self._prep_xfer_dlist,
+        )
+        self.receive_from_source = NixlTransferManager.receive_from_source.__get__(self)
+
+    def _prep_xfer_dlist(self, **kwargs):
+        self.prepared.append(kwargs)
+        raise RuntimeError("transfer started")
+
+    def register_tensors(self, tensors) -> None:
+        self._tensors = dict(tensors)
+
+    def add_remote_agent(self, _metadata) -> str:
+        return "peer-agent"
+
+    def remove_remote_agent(self, _name) -> None:
+        pass
+
+    def shutdown(self) -> None:
+        pass
+
+
+@pytest.mark.skipif(
+    importlib.util.find_spec("modelexpress") is None or not HAS_TORCH,
+    reason="modelexpress and torch required",
+)
+@pytest.mark.parametrize(
+    "peer_sizes",
+    [
+        pytest.param([64, 64], id="missing-allocation"),
+        pytest.param([64, 64, 64, 64], id="extra-allocation"),
+        pytest.param([64, 64, 32], id="size-mismatch"),
+    ],
+)
+def test_mx_restore_rejects_a_peer_with_other_allocations(monkeypatch, peer_sizes):
+    import torch
+    from modelexpress import p2p_pb2
+    from modelexpress.load_strategy.rdma_strategy import RdmaStrategy
+    from modelexpress.metadata import client_factory
+
+    agents: list[_CatalogAgent] = []
+
+    def start_agent(_rank, _device, port):
+        agents.append(_CatalogAgent(port))
+        return agents[-1]
+
+    monkeypatch.setattr(mx, "_start_nixl_manager", start_agent)
+    monkeypatch.setattr(
+        mx,
+        "byte_tensors",
+        lambda extents, _device: {
+            mx.allocation_tensor_name(i): torch.zeros(size, dtype=torch.uint8)
+            for i, (_va, size) in enumerate(extents)
+        },
+    )
+    monkeypatch.setattr(torch.cuda, "set_device", lambda _device: None)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda _device: None)
+    monkeypatch.setattr(client_factory, "create_metadata_client", lambda **_: None)
+    monkeypatch.setattr(RdmaStrategy, "is_available", lambda _self, _ctx: True)
+    monkeypatch.setattr(
+        RdmaStrategy,
+        "_find_source_instances",
+        lambda _self, _ctx: [
+            p2p_pb2.SourceInstanceRef(mx_source_id="src", worker_id="peer-0")
+        ],
+    )
+    peer = p2p_pb2.WorkerMetadata()
+    peer.tensor_source.tensors.extend(
+        p2p_pb2.TensorDescriptor(
+            name=mx.allocation_tensor_name(i),
+            addr=0x9000 + 0x100 * i,
+            size=size,
+            dtype="torch.uint8",
+        )
+        for i, size in enumerate(peer_sizes)
+    )
+    monkeypatch.setattr(RdmaStrategy, "_fetch_worker_metadata", lambda *_args: peer)
+    monkeypatch.setattr(RdmaStrategy, "_accelerator_compatible", lambda *_args: True)
+
+    backend = mx.MXTransferBackend(
+        config=GMSSnapshotConfig(
+            device=0,
+            max_workers=1,
+            backend_config={
+                "mx_rank": 0,
+                "mx_source_key": "ckpt-1",
+                "mx_listen_port": 25557,
+                # Without a server ModelExpress skips registering the allocations.
+                "mx_server_url": "mx.invalid:8001",
+            },
+        )
+    )
+    ids = ["a0", "a1", "a2"]
+    session = backend.start_restore([FileTransferSource(a, "", 0, 64) for a in ids])
+    with pytest.raises(Exception, match="mismatch"):
+        session.restore(
+            {
+                a: GMSTransferTarget(a, 0x1000 * (i + 1), 0, 64)
+                for i, a in enumerate(ids)
+            }
+        )
+    backend.close()
+
+    assert agents[0]._tensors.keys() == {mx.allocation_tensor_name(i) for i in range(3)}
+    assert agents[0].prepared == []
