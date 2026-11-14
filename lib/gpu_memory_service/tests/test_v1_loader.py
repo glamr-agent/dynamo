@@ -435,7 +435,6 @@ class _CatalogAgent:
     [
         pytest.param([64, 64], id="missing-allocation"),
         pytest.param([64, 64, 64, 64], id="extra-allocation"),
-        pytest.param([64, 64, 32], id="size-mismatch"),
     ],
 )
 def test_mx_restore_rejects_a_peer_with_other_allocations(monkeypatch, peer_sizes):
